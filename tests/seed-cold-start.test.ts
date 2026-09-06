@@ -138,7 +138,7 @@ describe("Anul II offline cold start", () => {
       pdf_url: ANUL_II_URL,
       source_pdf_hash: ANUL_II_HASH,
       groups: 26,
-      lessons: 289,
+      lessons: 288,
     });
 
     const schedule = await getCurrentSchedule(2);
@@ -151,7 +151,7 @@ describe("Anul II offline cold start", () => {
       source_pdf_hash: ANUL_II_HASH,
     });
     expect(schedule?.groups).toHaveLength(26);
-    expect(schedule?.lessons).toHaveLength(289);
+    expect(schedule?.lessons).toHaveLength(288);
     expect(schedule?.warnings).toEqual([]);
 
     const state = await getSourceState(2);
@@ -172,7 +172,7 @@ describe("Anul II offline cold start", () => {
     expect(calls).toContain(mirrorUrl);
     // It must never reach for the Anul I mirror on Anul II's behalf.
     expect(calls).not.toContain(courseSeed(1)!.mirrorUrl);
-    expect((await getCurrentSchedule(2))?.lessons).toHaveLength(289);
+    expect((await getCurrentSchedule(2))?.lessons).toHaveLength(288);
   });
 
   it("refuses mirror bytes that do not match the configured SHA-256", async () => {
@@ -247,7 +247,7 @@ describe("both courses bootstrap offline in the same process", () => {
     const two = await checkForUpdates(2);
 
     expect(one).toMatchObject({ course_year: 1, outcome: "seeded", groups: 41, lessons: 449 });
-    expect(two).toMatchObject({ course_year: 2, outcome: "seeded", groups: 26, lessons: 289 });
+    expect(two).toMatchObject({ course_year: 2, outcome: "seeded", groups: 26, lessons: 288 });
 
     const [scheduleOne, scheduleTwo] = await Promise.all([getCurrentSchedule(1), getCurrentSchedule(2)]);
     expect(scheduleOne?.metadata).toMatchObject({ course_year: 1, semester: "Semestrul I", source_pdf_hash: ANUL_I_HASH });

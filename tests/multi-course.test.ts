@@ -238,7 +238,7 @@ describe("storage isolation", () => {
     expect(two?.metadata.course_year).toBe(2);
     expect(two?.metadata.semester).toBe("Semestrul III");
     expect(two?.groups).toHaveLength(26);
-    expect(two?.lessons).toHaveLength(289);
+    expect(two?.lessons).toHaveLength(288);
     // The group columns of the two documents are genuinely different sets.
     expect(one?.groups.map((group) => group.name)).toContain(ANUL_I_GROUP);
     expect(one?.groups.map((group) => group.name)).not.toContain(ANUL_II_GROUP);
@@ -399,7 +399,7 @@ describe("update isolation", () => {
     expect(stateOne).toMatchObject({ current_pdf_url: ANUL_I_URL, etag: '"anul-i-v1"', semester: "Semestrul I" });
     expect(stateTwo).toMatchObject({ current_pdf_url: ANUL_II_URL, etag: '"anul-ii-v1"', semester: "Semestrul III" });
     expect((await getCurrentSchedule(1))?.lessons).toHaveLength(449);
-    expect((await getCurrentSchedule(2))?.lessons).toHaveLength(289);
+    expect((await getCurrentSchedule(2))?.lessons).toHaveLength(288);
   });
 
   it("lets one course fail while the other stays healthy, each with its own diagnostics", async () => {
@@ -420,7 +420,7 @@ describe("update isolation", () => {
     expect(stateTwo.last_error).toBeTruthy();
     // Both last-known-good schedules are still served.
     expect((await getCurrentSchedule(1))?.lessons).toHaveLength(449);
-    expect((await getCurrentSchedule(2))?.lessons).toHaveLength(289);
+    expect((await getCurrentSchedule(2))?.lessons).toHaveLength(288);
     expect((await buildStatus(1)).has_schedule).toBe(true);
     expect((await buildStatus(2)).has_schedule).toBe(true);
   });
@@ -435,7 +435,7 @@ describe("update isolation", () => {
     expect((await getSourceState(2)).last_error).toBeNull();
     expect((await getSourceState(1)).last_error).toBeTruthy();
     expect((await getCurrentSchedule(1))?.lessons).toHaveLength(449);
-    expect((await getCurrentSchedule(2))?.lessons).toHaveLength(289);
+    expect((await getCurrentSchedule(2))?.lessons).toHaveLength(288);
   });
 });
 
@@ -578,7 +578,7 @@ describe("public API course selection", () => {
     expect(one.groups).toHaveLength(41);
     expect(one.metadata.semester).toBe("Semestrul I");
     expect(two.course_year).toBe(2);
-    expect(two.count).toBe(289);
+    expect(two.count).toBe(288);
     expect(two.groups).toHaveLength(26);
     expect(two.metadata.semester).toBe("Semestrul III");
     expect(one.groups).not.toEqual(two.groups);
@@ -610,7 +610,7 @@ describe("public API course selection", () => {
     }>(await statusRoute(get("/api/status?course=2")));
 
     expect(one).toMatchObject({ course_year: 1, schedule: { semester: "Semestrul I", lessons: 449 } });
-    expect(two).toMatchObject({ course_year: 2, schedule: { semester: "Semestrul III", lessons: 289 } });
+    expect(two).toMatchObject({ course_year: 2, schedule: { semester: "Semestrul III", lessons: 288 } });
     expect(two.course_label).toBe("Anul II");
     expect(two.schedule.source_pdf_url).toBe(ANUL_II_URL);
     expect(two.supported_courses.map((course) => course.course_year)).toEqual([1, 2]);

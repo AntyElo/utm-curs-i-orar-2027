@@ -15,6 +15,12 @@ const SAME_LINE_TOLERANCE_PT = 1.0;
 const MIN_COVERAGE_RATIO = 0.5;
 /** A mapped cell must lie this much inside the slot rows it covers. */
 const MIN_INSIDE_ROWS_RATIO = 0.6;
+/** Minimum margin (pt) on both sides of a horizontal ruling to count as materially straddling it. */
+const MIN_RULING_STRADDLE_PT = 0.6;
+/** Minimum horizontal overlap between an item and a ruling to count as crossing. */
+const MIN_RULING_OVERLAP_PT = 0.5;
+/** Tolerance for text items extending beyond the enclosing cell boundaries. */
+const CELL_OVERFLOW_TOLERANCE_PT = 0.5;
 
 export interface TableCell {
   key: string;
@@ -43,6 +49,7 @@ export function buildCells(texts: TextItem[], grid: Grid, layout: TableLayout, p
     const found = enclosingCell(grid, cx, cy);
     if (!found) continue;
     const bounds = clampToTable(found, layout);
+    if (!itemBelongsInCell(item, bounds, grid)) continue;
     const key = cellKey(bounds);
     const bucket = byCell.get(key) ?? { bounds, items: [] };
     bucket.items.push(item);
@@ -70,8 +77,56 @@ export function buildCells(texts: TextItem[], grid: Grid, layout: TableLayout, p
     else orphans.push(cell);
   }
 
-  cells.sort((a, b) => a.bounds.y0 - b.bounds.y0 || a.bounds.x0 - b.bounds.x0);
-  return { cells, orphans };
+  const filteredCells = dropEngulfingCells(cells, orphans);
+  filteredCells.sort((a, b) => a.bounds.y0 - b.bounds.y0 || a.bounds.x0 - b.bounds.x0);
+  return { cells: filteredCells, orphans };
+}
+
+/**
+ * A TextItem must geometrically belong inside its reconstructed cell,
+ * rather than merely having its center sampled inside it.
+ * Items whose bounding box materially straddles a drawn grid ruling
+ * or extends beyond the enclosing cell boundaries are rejected.
+ */
+function itemBelongsInCell(item: TextItem, cell: CellBounds, grid: Grid): boolean {
+  if (item.y1 > cell.y1 + CELL_OVERFLOW_TOLERANCE_PT) return false;
+  for (const line of grid.horizontal) {
+    if (line.at > item.y0 + MIN_RULING_STRADDLE_PT && line.at < item.y1 - MIN_RULING_STRADDLE_PT) {
+      if (overlap1d(line.from, line.to, item.x0, item.x1) > MIN_RULING_OVERLAP_PT) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Sanity defence: a reconstructed cell should not silently engulf other independently
+ * reconstructed cells occupying the same slot row. Engulfing cells are demoted to orphans.
+ */
+function dropEngulfingCells(cells: TableCell[], orphans: TableCell[]): TableCell[] {
+  const result: TableCell[] = [];
+  for (const cell of cells) {
+    const engulfsOther = cells.some((other) => {
+      if (other === cell) return false;
+      if (other.day !== cell.day) return false;
+      const sharesRow = cell.rows.some((r1) => other.rows.some((r2) => r2.day === r1.day && r2.start_time === r1.start_time));
+      if (!sharesRow) return false;
+      const overlapY = overlap1d(cell.bounds.y0, cell.bounds.y1, other.bounds.y0, other.bounds.y1);
+      const minH = Math.min(cell.bounds.y1 - cell.bounds.y0, other.bounds.y1 - other.bounds.y0);
+      if (overlapY < minH * 0.5) return false;
+      const widthCell = cell.bounds.x1 - cell.bounds.x0;
+      const widthOther = other.bounds.x1 - other.bounds.x0;
+      return (
+        cell.bounds.x0 <= other.bounds.x0 + 1 &&
+        cell.bounds.x1 >= other.bounds.x1 - 1 &&
+        widthCell > widthOther + 10
+      );
+    });
+    if (engulfsOther) orphans.push(cell);
+    else result.push(cell);
+  }
+  return result;
 }
 
 /**

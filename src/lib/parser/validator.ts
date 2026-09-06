@@ -64,6 +64,41 @@ export function validateSchedule(schedule: Schedule, context: ValidationContext 
     warnings.push(`groups without lessons: ${groupsWithoutLessons.map((group) => group.name).join(", ")}`);
   }
 
+  // Detect unresolved slot collisions (different independent lessons in the same group/slot)
+  for (const group of schedule.groups) {
+    for (const day of schedule.days) {
+      for (const slot of schedule.time_slots) {
+        const matching = schedule.lessons.filter(
+          (l) => l.day === day && l.start_time === slot.start_time && l.groups.includes(group.name),
+        );
+        if (matching.length <= 1) continue;
+        for (let i = 0; i < matching.length; i++) {
+          for (let j = i + 1; j < matching.length; j++) {
+            const a = matching[i];
+            const b = matching[j];
+            const parityOverlap = a.week_parity === "both" || b.week_parity === "both" || a.week_parity === b.week_parity;
+            const noSubgroupDiff = (!a.subgroup && !b.subgroup) || a.subgroup === b.subgroup;
+            const different = a.subject !== b.subject || a.raw_text !== b.raw_text;
+            if (parityOverlap && noSubgroupDiff && different) {
+              warnings.push(
+                `unresolved slot collision for ${group.name} on ${day} ${slot.start_time}: "${a.subject}" vs "${b.subject}"`,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Detect suspicious broad lessons (large group span with unknown type and no teacher/room)
+  for (const lesson of schedule.lessons) {
+    if (lesson.groups.length >= 10 && lesson.lesson_type === "unknown" && !lesson.teacher && !lesson.room) {
+      warnings.push(
+        `suspicious broad lesson spanning ${lesson.groups.length} groups with no teacher/room: "${lesson.subject}" (${lesson.day} ${lesson.start_time})`,
+      );
+    }
+  }
+
   const previous = context.previousLessonCount ?? null;
   if (previous !== null && previous > 0 && schedule.lessons.length < previous * config.minLessonRatio) {
     errors.push(

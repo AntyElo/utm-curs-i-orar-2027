@@ -14,6 +14,7 @@ import type { Grid } from "@/lib/parser/geometry";
 
 const FIXTURE = path.join(__dirname, "fixtures", "anul_i_semestrul_ii-1.pdf");
 const SEED = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-9.pdf");
+const SEED_ANUL_II = path.join(__dirname, "..", "data", "seed", "anul_ii_semestrul_iii-8.pdf");
 const REGRESSION = path.join(__dirname, "fixtures", "expected-spring-2026.json");
 const SEED_HASH = "52e7f14be27a996e17d0614c1f9fe769d63bdf76876fce6d4fc60f026bf8c015";
 
@@ -30,19 +31,33 @@ let grid: Grid;
 let artifacts: ParseArtifacts;
 let seedBytes: Uint8Array;
 let seedArtifacts: ParseArtifacts;
+let seedBytesAnulII: Uint8Array;
+let seedArtifactsAnulII: ParseArtifacts;
 
 beforeAll(async () => {
-  const [fixtureBytes, bundledBytes] = await Promise.all([readFile(FIXTURE), readFile(SEED)]);
+  const [fixtureBytes, bundledBytes, bundledAnulIIBytes] = await Promise.all([
+    readFile(FIXTURE),
+    readFile(SEED),
+    readFile(SEED_ANUL_II),
+  ]);
   pdfBytes = new Uint8Array(fixtureBytes);
   seedBytes = new Uint8Array(bundledBytes);
+  seedBytesAnulII = new Uint8Array(bundledAnulIIBytes);
   [page] = await extractPages(pdfBytes);
   grid = buildGrid(page.rects);
-  [artifacts, seedArtifacts] = await Promise.all([
+  [artifacts, seedArtifacts, seedArtifactsAnulII] = await Promise.all([
     parsePdf(pdfBytes, provenance),
     parsePdf(seedBytes, {
       ...provenance,
       source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
       source_kind: "seed",
+      course_year: 1,
+    }),
+    parsePdf(seedBytesAnulII, {
+      ...provenance,
+      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-8.pdf",
+      source_kind: "seed",
+      course_year: 2,
     }),
   ]);
 });
@@ -468,5 +483,101 @@ describe("regression fixture", () => {
       expect(found!.week_parity).toBe(sample.week_parity);
       expect(found!.groups.length, JSON.stringify(sample)).toBe(sample.group_count);
     }
+  });
+});
+
+describe("autumn 2026 packaged-seed course 2 regression", () => {
+  it("eliminates phantom MCE lesson and satisfies all cardinality invariants", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const phantom = schedule.lessons.filter(
+      (lesson) =>
+        lesson.day === "Marți" &&
+        lesson.start_time === "18:45" &&
+        /\bMCE\b/i.test(`${lesson.subject} ${lesson.raw_text}`),
+    );
+    expect(phantom).toHaveLength(0);
+    expect(schedule.groups).toHaveLength(26);
+    expect(schedule.lessons).toHaveLength(288);
+    expect(schedule.lessons.filter((l) => l.groups.length > 1)).toHaveLength(64);
+    expect(schedule.lessons.filter((l) => l.uncertain)).toHaveLength(0);
+    expect(validateSchedule(schedule).ok).toBe(true);
+    expect(schedule.warnings).toEqual([]);
+  });
+
+  it("preserves exactly the verified POO blocks at Tuesday 18:45 with no stray groups", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const tues1845 = schedule.lessons.filter((l) => l.day === "Marți" && l.start_time === "18:45");
+    expect(tues1845).toHaveLength(2);
+
+    const ti = tues1845.find((l) => l.groups.includes("TI-251"));
+    expect(ti).toBeDefined();
+    expect(ti!.groups).toEqual(["TI-251", "TI-252", "TI-253", "TI-254"]);
+    expect(ti!.subject).toBe("Programarea Orientată pe Obiecte");
+    expect(ti!.teacher).toBe("Gîncu S.");
+    expect(ti!.room).toBe("6-2");
+    expect(ti!.lesson_type).toBe("lecture");
+
+    const si = tues1845.find((l) => l.groups.includes("SI-251"));
+    expect(si).toBeDefined();
+    expect(si!.groups).toEqual(["SI-251", "SI-252"]);
+    expect(si!.subject).toBe("POO");
+    expect(si!.teacher).toBe("Gîncu S.");
+    expect(si!.room).toBe("6-2");
+    expect(si!.lesson_type).toBe("lecture");
+
+    // No other Anul II group receives any lesson in this slot
+    const coveredGroups = new Set(tues1845.flatMap((l) => l.groups));
+    expect([...coveredGroups].sort()).toEqual(["SI-251", "SI-252", "TI-251", "TI-252", "TI-253", "TI-254"]);
+  });
+
+  it("preserves known-good regression anchors", () => {
+    const { schedule } = seedArtifactsAnulII;
+
+    // Large legitimate colspan: Luni 13:30 Matematici Speciale Pricop V. 3-3 Amdaris
+    const matSpec = schedule.lessons.find((l) => l.day === "Luni" && l.start_time === "13:30" && l.groups.includes("AI-252"));
+    expect(matSpec).toBeDefined();
+    expect(matSpec!.subject).toBe("Matematici Speciale");
+    expect(matSpec!.teacher).toBe("Pricop V.");
+    expect(matSpec!.room).toBe("3-3 Amdaris");
+    expect(matSpec!.groups).toEqual(["AI-252", "AI-251", "CR-251", "CR-252", "R-251", "MN-251", "IBM-251"]);
+
+    // Odd half-cell: CR-251 Luni 08:00 Circuite și dispozitive electronice Chiriac M. A03 odd
+    const cdeOdd = schedule.lessons.find((l) => l.day === "Luni" && l.start_time === "08:00" && l.groups.includes("CR-251"));
+    expect(cdeOdd).toMatchObject({
+      subject: "Circuite și dispozitive electronice",
+      teacher: "Chiriac M.",
+      room: "A03",
+      week_parity: "odd",
+    });
+
+    // Even half-cell: AI-252 Luni 09:45 TSA Izvoreanu B. 524 even
+    const tsaEven = schedule.lessons.find(
+      (l) => l.day === "Luni" && l.start_time === "09:45" && l.groups.includes("AI-252") && l.subject === "TSA",
+    );
+    expect(tsaEven).toMatchObject({
+      subject: "TSA",
+      teacher: "Izvoreanu B.",
+      room: "524",
+      week_parity: "even",
+    });
+
+    // Multi-slot subgroup lesson: IBM-251 Marți 08:00–11:15 slot_span=2 1) CDE Chiriac M. A03 subgroup=0.5 gr.
+    const cdeSub = schedule.lessons.find((l) => l.day === "Marți" && l.start_time === "08:00" && l.groups.includes("IBM-251"));
+    expect(cdeSub).toMatchObject({
+      subject: "1) CDE",
+      teacher: "Chiriac M.",
+      room: "A03",
+      slot_span: 2,
+      subgroup: "0.5 gr.",
+    });
+
+    // Normal single-group lesson: AI-252 Miercuri 13:30 CEI Moraru D. 524
+    const cei = schedule.lessons.find((l) => l.day === "Miercuri" && l.start_time === "13:30" && l.groups.includes("AI-252"));
+    expect(cei).toMatchObject({
+      subject: "CEI",
+      teacher: "Moraru D.",
+      room: "524",
+      groups: ["AI-252"],
+    });
   });
 });
