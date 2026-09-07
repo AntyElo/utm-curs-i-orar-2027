@@ -1,0 +1,16 @@
+name = "fcim-schedule-broker"
+main = "src/index.ts"
+compatibility_date = "2024-09-01"
+
+# Bind R2 bucket for candidate snapshots and accepted state
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "fcim-schedule-broker"
+
+# Cron trigger for periodic FCIM candidate publication check
+[triggers]
+crons = ["*/20 * * * *"]
+
+[vars]
+FCIM_PAGE_API_URL = "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view"
+SCHEDULE_PAGE_URL = "https://fcim.utm.md/procesul-de-studii/orar/"

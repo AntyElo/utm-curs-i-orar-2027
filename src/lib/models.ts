@@ -86,6 +86,8 @@ export const ScheduleMetadataSchema = z.object({
   source_pdf_hash: z.string(),
   /** "manual" = authenticated explicit official-PDF recovery; other values describe discovery/bootstrap. */
   source_kind: z.enum(["live", "wayback", "seed", "manual"]),
+  source_transport: z.enum(["direct", "broker"]).default("direct"),
+  source_snapshot_id: z.string().nullable().default(null),
   downloaded_at: z.string(),
   parsed_at: z.string(),
   parser_version: z.string(),
@@ -105,6 +107,62 @@ export const ScheduleSchema = z.object({
   warnings: z.array(z.string()),
 });
 export type Schedule = z.infer<typeof ScheduleSchema>;
+
+export const SnapshotSourceSchema = z.object({
+  page_api_url: z.string(),
+  page_id: z.number().nullable().default(null),
+  page_modified_gmt: z.string().nullable().default(null),
+  retrieved_at: z.string(),
+  etag: z.string().nullable().default(null),
+  last_modified: z.string().nullable().default(null),
+});
+export type SnapshotSource = z.infer<typeof SnapshotSourceSchema>;
+
+export const SnapshotFileSchema = z.object({
+  filename: z.string(),
+  source_url: z.string(),
+  r2_key: z.string(),
+  content_type: z.string().nullable().default(null),
+  size: z.number().nullable().default(null),
+  upstream_etag: z.string().nullable().default(null),
+  upstream_last_modified: z.string().nullable().default(null),
+});
+export type SnapshotFile = z.infer<typeof SnapshotFileSchema>;
+
+export const SnapshotManifestSchema = z.object({
+  schema_version: z.literal(1).default(1),
+  snapshot_id: z.string(),
+  previous_snapshot_id: z.string().nullable().default(null),
+  created_at: z.string(),
+  source: SnapshotSourceSchema,
+  files: z.array(SnapshotFileSchema),
+});
+export type SnapshotManifest = z.infer<typeof SnapshotManifestSchema>;
+
+export const CurrentPointerSchema = z.object({
+  schema_version: z.literal(1).default(1),
+  snapshot_id: z.string(),
+  updated_at: z.string(),
+  manifest_r2_key: z.string(),
+});
+export type CurrentPointer = z.infer<typeof CurrentPointerSchema>;
+
+export const AcceptedRecordSchema = z.object({
+  schema_version: z.literal(1).default(1),
+  course_year: z.number().int(),
+  snapshot_id: z.string(),
+  source_pdf_url: z.string(),
+  source_pdf_hash: z.string().regex(/^[a-f0-9]{64}$/i, "expected 64-character SHA-256 hash"),
+  accepted_at: z.string(),
+  schedule: ScheduleSchema,
+});
+export type AcceptedRecord = z.infer<typeof AcceptedRecordSchema>;
+
+export const AcceptedWriteRequestSchema = z.object({
+  expected_previous_hash: z.string().nullable(),
+  state: AcceptedRecordSchema,
+});
+export type AcceptedWriteRequest = z.infer<typeof AcceptedWriteRequestSchema>;
 
 /** Persisted state of the auto-update loop. */
 export const SourceStateSchema = z.object({

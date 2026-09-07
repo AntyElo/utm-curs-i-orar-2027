@@ -31,6 +31,8 @@ function scheduleFor(courseYear: number): Schedule {
       source_pdf_url: `https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_${courseYear}.pdf`,
       source_pdf_hash: `hash-${courseYear}`,
       source_kind: "live",
+      source_transport: "direct",
+      source_snapshot_id: null,
       downloaded_at: "2026-09-01T00:00:00.000Z",
       parsed_at: "2026-09-01T00:00:00.000Z",
       parser_version: "1.1.0",

@@ -48,6 +48,8 @@ function scheduleFor(courseYear: number, url = PDF_A, hash = `hash-${courseYear}
       source_pdf_url: url,
       source_pdf_hash: hash,
       source_kind: "live",
+      source_transport: "direct",
+      source_snapshot_id: null,
       downloaded_at: "2026-09-01T00:00:00.000Z",
       parsed_at: "2026-09-01T00:00:00.000Z",
       parser_version: "1.1.0",

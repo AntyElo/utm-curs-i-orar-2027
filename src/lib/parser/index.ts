@@ -22,6 +22,8 @@ export interface Provenance {
   source_page_url: string;
   source_pdf_url: string;
   source_kind: ScheduleMetadata["source_kind"];
+  source_transport?: ScheduleMetadata["source_transport"];
+  source_snapshot_id?: string | null;
   downloaded_at: string;
   /** Course year the caller asked for. Only fills the gap when the PDF prints no title;
    *  a title that names its own course year always wins, which is what the updater's
@@ -93,6 +95,8 @@ export async function parsePdf(pdfBytes: Uint8Array, provenance: Provenance): Pr
     source_pdf_url: provenance.source_pdf_url,
     source_pdf_hash: sha256(pdfBytes),
     source_kind: provenance.source_kind,
+    source_transport: provenance.source_transport ?? "direct",
+    source_snapshot_id: provenance.source_snapshot_id ?? null,
     downloaded_at: provenance.downloaded_at,
     parsed_at: new Date().toISOString(),
     parser_version: config.parserVersion,

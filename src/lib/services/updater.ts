@@ -24,6 +24,14 @@ import {
   type FetchedResource,
 } from "@/lib/source/downloader";
 import { splitPdfRevision } from "@/lib/source/revision";
+import {
+  fetchAcceptedSchedule,
+  fetchCandidatePdf,
+  fetchCurrentPointer,
+  fetchSnapshotManifest,
+  putAcceptedSchedule,
+} from "@/lib/source/broker-client";
+import type { AcceptedRecord, SnapshotFile, SnapshotManifest } from "@/lib/models";
 import { getCurrentSchedule, getSourceState, replaceCurrentSchedule, saveSourceState } from "@/lib/storage";
 
 const log = getLogger("updater");
@@ -171,8 +179,247 @@ async function discoverCurrentPdf(courseYear: number): Promise<Discovery> {
   }
 }
 
+export function selectCandidateFile(manifest: SnapshotManifest, courseYear: number): SnapshotFile | null {
+  const romanMap: Record<number, string> = { 1: "i", 2: "ii", 3: "iii", 4: "iv" };
+  const roman = romanMap[courseYear] ?? String(courseYear);
+  const pattern = new RegExp(`anul[_-]${roman}(?:[^a-z0-9]|$)`, "i");
+
+  const matches = manifest.files.filter((f) => pattern.test(f.filename) || pattern.test(f.source_url));
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0];
+
+  let best = matches[0];
+  let bestRev = splitPdfRevision(best.filename).revision;
+  for (const m of matches.slice(1)) {
+    const rev = splitPdfRevision(m.filename).revision;
+    if (rev > bestRev) {
+      best = m;
+      bestRev = rev;
+    }
+  }
+  return best;
+}
+
+async function runBrokerAutomaticCheck(
+  courseYear: number,
+  options: { force?: boolean; startedAt: string },
+): Promise<CheckResult> {
+  let current = await getCurrentSchedule(courseYear);
+
+  // Synchronize local state if durable accepted state is ahead or different
+  try {
+    const durableAccepted = await fetchAcceptedSchedule(courseYear, { timeoutMs: config.brokerTimeoutMs });
+    if (durableAccepted && durableAccepted.schedule) {
+      const mismatch = courseYearMismatch(durableAccepted.schedule, courseYear);
+      if (!mismatch) {
+        if (!current || current.metadata.source_pdf_hash !== durableAccepted.source_pdf_hash) {
+          log.warn("local schedule out of sync with durable accepted state; synchronizing local state", {
+            courseYear,
+            localHash: current?.metadata.source_pdf_hash ?? null,
+            durableHash: durableAccepted.source_pdf_hash,
+          });
+          await replaceCurrentSchedule(courseYear, durableAccepted.schedule);
+          await saveSourceState(courseYear, {
+            current_pdf_url: durableAccepted.source_pdf_url,
+            current_pdf_hash: durableAccepted.source_pdf_hash,
+            etag: durableAccepted.schedule.metadata.etag,
+            last_modified: durableAccepted.schedule.metadata.last_modified,
+            last_success_at: durableAccepted.accepted_at,
+            last_result: "updated",
+            academic_year: durableAccepted.schedule.metadata.academic_year,
+            semester: durableAccepted.schedule.metadata.semester,
+          });
+          current = durableAccepted.schedule;
+        }
+      }
+    }
+  } catch (syncErr) {
+    log.warn("durable accepted state check failed during sync", { courseYear, error: errorMessage(syncErr) });
+  }
+
+  const pointer = await fetchCurrentPointer({ timeoutMs: config.brokerTimeoutMs });
+  if (!pointer) {
+    throw new Error("Could not fetch current snapshot pointer from broker");
+  }
+
+  const manifest = await fetchSnapshotManifest(pointer.snapshot_id, { timeoutMs: config.brokerTimeoutMs });
+  if (!manifest) {
+    throw new Error(`Could not fetch snapshot manifest for ${pointer.snapshot_id} from broker`);
+  }
+
+  const candidateFile = selectCandidateFile(manifest, courseYear);
+  if (!candidateFile) {
+    throw new Error(`No candidate PDF found in snapshot ${pointer.snapshot_id} for course year ${courseYear}`);
+  }
+
+  const staleParser = current !== null && current.metadata.parser_version !== config.parserVersion;
+  const sourceUpgrade = current !== null && current.metadata.source_transport !== "broker";
+  const sourceUrlChanged = current !== null && current.metadata.source_pdf_url !== candidateFile.source_url;
+  const mustApply = Boolean(options.force || staleParser || sourceUpgrade || sourceUrlChanged);
+
+  if (!mustApply && current && candidateFile.upstream_etag && current.metadata.etag === candidateFile.upstream_etag) {
+    await saveSourceState(courseYear, {
+      last_check_at: options.startedAt,
+      last_result: "unchanged",
+    });
+    return {
+      course_year: courseYear,
+      outcome: "unchanged",
+      message: "Candidate PDF unchanged (ETag match)",
+      pdf_url: candidateFile.source_url,
+      source_pdf_hash: current.metadata.source_pdf_hash,
+      groups: current.groups.length,
+      lessons: current.lessons.length,
+    };
+  }
+
+  const resource = await fetchCandidatePdf(pointer.snapshot_id, candidateFile.filename, {
+    timeoutMs: config.httpTimeoutMs,
+  });
+
+  const hash = sha256(resource.bytes);
+
+  if (!mustApply && current && hash === current.metadata.source_pdf_hash) {
+    await saveSourceState(courseYear, {
+      current_pdf_url: candidateFile.source_url,
+      current_pdf_hash: hash,
+      etag: candidateFile.upstream_etag,
+      last_modified: candidateFile.upstream_last_modified,
+      last_check_at: options.startedAt,
+      last_result: "unchanged",
+    });
+    return {
+      course_year: courseYear,
+      outcome: "unchanged",
+      message: "Candidate PDF hash unchanged",
+      pdf_url: candidateFile.source_url,
+      source_pdf_hash: hash,
+      groups: current.groups.length,
+      lessons: current.lessons.length,
+    };
+  }
+
+  const provenance: Provenance = {
+    source_page_url: manifest.source.page_api_url,
+    source_pdf_url: candidateFile.source_url,
+    source_kind: "live",
+    source_transport: "broker",
+    source_snapshot_id: pointer.snapshot_id,
+    downloaded_at: options.startedAt,
+    etag: candidateFile.upstream_etag,
+    last_modified: candidateFile.upstream_last_modified,
+    course_year: courseYear,
+  };
+
+  const built = await buildValidatedSchedule(courseYear, resource.bytes, provenance, current);
+  if (!built.schedule) {
+    await saveSourceState(courseYear, {
+      last_check_at: options.startedAt,
+      last_result: "rejected",
+      last_error: built.result.message,
+      last_error_at: options.startedAt,
+    });
+    return built.result;
+  }
+
+  const validatedSchedule = built.schedule;
+
+  // CRITICAL TRANSACTION ORDERING (Section 13):
+  // 1. Write durable accepted state to R2 with CAS FIRST
+  const acceptedRecord: AcceptedRecord = {
+    schema_version: 1,
+    course_year: courseYear,
+    snapshot_id: pointer.snapshot_id,
+    source_pdf_url: candidateFile.source_url,
+    source_pdf_hash: hash,
+    accepted_at: options.startedAt,
+    schedule: validatedSchedule,
+  };
+
+  const expectedPreviousHash = current?.metadata.source_pdf_hash ?? null;
+  const putResult = await putAcceptedSchedule(courseYear, expectedPreviousHash, acceptedRecord);
+
+  if (!putResult.ok) {
+    const errorMsg = `Durable accepted write failed (status ${putResult.status}): ${putResult.message ?? "unknown error"}`;
+    log.error(errorMsg, { courseYear, conflict: putResult.conflict });
+    await saveSourceState(courseYear, {
+      last_check_at: options.startedAt,
+      last_result: "error",
+      last_error: errorMsg,
+      last_error_at: options.startedAt,
+    });
+    return {
+      course_year: courseYear,
+      outcome: "error",
+      message: errorMsg,
+    };
+  }
+
+  // 2. ONLY AFTER durable success: replaceCurrentSchedule() locally
+  await replaceCurrentSchedule(courseYear, validatedSchedule);
+
+  await saveSourceState(courseYear, {
+    current_pdf_url: candidateFile.source_url,
+    current_pdf_hash: hash,
+    etag: candidateFile.upstream_etag,
+    last_modified: candidateFile.upstream_last_modified,
+    last_check_at: options.startedAt,
+    last_success_at: options.startedAt,
+    last_result: "updated",
+    academic_year: validatedSchedule.metadata.academic_year,
+    semester: validatedSchedule.metadata.semester,
+  });
+
+  log.info("schedule updated via broker", {
+    courseYear,
+    pdf: candidateFile.source_url,
+    hash,
+    snapshot_id: pointer.snapshot_id,
+    groups: validatedSchedule.groups.length,
+    lessons: validatedSchedule.lessons.length,
+  });
+
+  return {
+    ...built.result,
+    pdf_url: candidateFile.source_url,
+    source_pdf_hash: hash,
+  };
+}
+
 async function runAutomaticCheck(courseYear: number, options: { force?: boolean }): Promise<CheckResult> {
   const startedAt = new Date().toISOString();
+
+  if (config.brokerUrl) {
+    try {
+      return await runBrokerAutomaticCheck(courseYear, { ...options, startedAt });
+    } catch (brokerError) {
+      const message = errorMessage(brokerError);
+      log.error("broker schedule check failed", { courseYear, error: message });
+      await saveSourceState(courseYear, {
+        last_check_at: startedAt,
+        last_result: "error",
+        last_error: message,
+        last_error_at: startedAt,
+      });
+
+      if (!(await getCurrentSchedule(courseYear))) {
+        try {
+          return await seedFromBundledPdf(courseYear);
+        } catch (seedError) {
+          const fallbackMessage = `seed fallback failed: ${errorMessage(seedError)}`;
+          const combinedMessage = `${message}; ${fallbackMessage}`;
+          await saveSourceState(courseYear, {
+            last_check_at: startedAt,
+            last_result: "error",
+            last_error: combinedMessage,
+            last_error_at: startedAt,
+          });
+          return { course_year: courseYear, outcome: "error", message: combinedMessage };
+        }
+      }
+      return { course_year: courseYear, outcome: "error", message };
+    }
+  }
 
   try {
     await promoteBundledSeedIfNewer(courseYear);
@@ -720,6 +967,81 @@ async function seedFromBundledPdf(courseYear: number): Promise<CheckResult> {
     groups: applied.schedule.groups.length,
     lessons: applied.schedule.lessons.length,
   };
+}
+
+/**
+ * Cold-start bootstrap: bounded restoration of initial schedule state before candidate validation.
+ *
+ * For each supported course:
+ * - If local accepted schedule exists: keep it.
+ * - If local state is absent:
+ *   - If broker is configured: attempt to fetch durable accepted schedule GET /accepted/course-N
+ *     - Validate schema, course guard, and atomically restore local state.
+ *   - If broker unavailable, 404, or invalid: restore bundled seed as last resort.
+ */
+export async function bootstrapScheduleState(): Promise<void> {
+  for (const courseYear of SUPPORTED_COURSE_YEARS) {
+    try {
+      const existing = await getCurrentSchedule(courseYear);
+      if (existing) {
+        log.info("cold-start bootstrap: local schedule already present", { courseYear });
+        continue;
+      }
+
+      let restoredFromBroker = false;
+      if (config.brokerUrl) {
+        try {
+          const accepted = await fetchAcceptedSchedule(courseYear, { timeoutMs: config.brokerTimeoutMs });
+          if (accepted && accepted.schedule) {
+            const mismatch = courseYearMismatch(accepted.schedule, courseYear);
+            if (!mismatch) {
+              await replaceCurrentSchedule(courseYear, accepted.schedule);
+              await saveSourceState(courseYear, {
+                current_pdf_url: accepted.source_pdf_url,
+                current_pdf_hash: accepted.source_pdf_hash,
+                etag: accepted.schedule.metadata.etag,
+                last_modified: accepted.schedule.metadata.last_modified,
+                last_success_at: accepted.accepted_at,
+                last_result: "updated",
+                academic_year: accepted.schedule.metadata.academic_year,
+                semester: accepted.schedule.metadata.semester,
+              });
+              log.info("cold-start bootstrap: restored schedule from broker durable accepted state", {
+                courseYear,
+                hash: accepted.source_pdf_hash,
+                lessons: accepted.schedule.lessons.length,
+              });
+              restoredFromBroker = true;
+            } else {
+              log.warn("cold-start bootstrap: broker accepted schedule rejected due to course year mismatch", {
+                courseYear,
+                mismatch,
+              });
+            }
+          }
+        } catch (brokerError) {
+          log.warn("cold-start bootstrap: broker restoration failed", {
+            courseYear,
+            error: errorMessage(brokerError),
+          });
+        }
+      }
+
+      if (!restoredFromBroker) {
+        try {
+          await seedFromBundledPdf(courseYear);
+          log.info("cold-start bootstrap: restored bundled seed", { courseYear });
+        } catch (seedError) {
+          log.warn("cold-start bootstrap: bundled seed restoration failed", {
+            courseYear,
+            error: errorMessage(seedError),
+          });
+        }
+      }
+    } catch (error) {
+      log.error("cold-start bootstrap failed for course", { courseYear, error: errorMessage(error) });
+    }
+  }
 }
 
 /**
