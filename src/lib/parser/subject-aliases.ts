@@ -57,8 +57,8 @@ export const SUBJECT_ALIASES = new Map<string, string>([
   ["L. Română", "Limba română"],
   ["L.Română", "Limba română"],
   ["L. Străină", "Limba străină"],
-  ["L. Engleză 1", "Limba engleză 1"],
-  ["L.Engleza 1", "Limba engleză 1"],
+  ["L. Engleză 1", "Limba engleză"],
+  ["L.Engleza 1", "Limba engleză"],
   ["L. Engleză A1", "Limba engleză A1"],
   ["L.Engleză A1", "Limba engleză A1"],
   ["L. engleză A1", "Limba engleză A1"],
@@ -104,6 +104,58 @@ export const KNOWN_SUBJECT_TYPO_ALIASES = new Map<string, string>([
   // Language typo / truncation variants
   ["L. Rom.", "Limba română"],
   ["L.Rom", "Limba română"],
+
+  // Confirmed whole-subject canonical mappings
+  // 1. Dreptul de Proprietate Intelectuală → Dreptul Proprietății Intelectuale
+  ["Dreptul de Proprietate Intelectuală", "Dreptul proprietății intelectuale"],
+  ["Dreptul de proprietate intelectuală", "Dreptul proprietății intelectuale"],
+
+  // 2. Proiectarea Conceptelor AS → Proiectarea conceptuală a unei aplicații software
+  ["Proiectarea Conceptelor AS", "Proiectarea conceptuală a unei aplicații software"],
+  ["Proiectarea conceptelor AS", "Proiectarea conceptuală a unei aplicații software"],
+
+  // 3. Circuite și Dispozitive Electrice → Circuite și dispozitive electronice
+  ["Circuite și Dispozitive Electrice", "Circuite și dispozitive electronice"],
+  ["Circuite și dispozitive electrice", "Circuite și dispozitive electronice"],
+
+  // 4. Ed. Fizică → Educație fizică
+  ["Ed. Fizică", "Educație fizică"],
+  ["Ed. fizică", "Educație fizică"],
+
+  // 5. Fizica → Fizică
+  ["Fizica", "Fizică"],
+  ["fizica", "Fizică"],
+
+  // 6. Algebră Liniară și Geometrie Analitică → Algebra liniară și geometria analitică
+  ["Algebră Liniară și Geometrie Analitică", "Algebra liniară și geometria analitică"],
+  ["Algebră liniară și geometrie analitică", "Algebra liniară și geometria analitică"],
+
+  // 7. Etica și Integritatea Academică → Etică și integritate academică
+  ["Etica și Integritatea Academică", "Etică și integritate academică"],
+  ["Etica și integritatea academică", "Etică și integritate academică"],
+
+  // 8. Security/ethics variants → Etică și securitatea umană
+  ["Etica și Securitate Umană", "Etică și securitatea umană"],
+  ["Etica și securitate umană", "Etică și securitatea umană"],
+  ["Etica și Securitate umană", "Etică și securitatea umană"],
+  ["Etică și Securitate Umană", "Etică și securitatea umană"],
+  ["Etică și securitate umană", "Etică și securitatea umană"],
+  ["Etică și Securitate umană", "Etică și securitatea umană"],
+  ["Etica și Securitatea Umană", "Etică și securitatea umană"],
+  ["Etica și securitatea umană", "Etică și securitatea umană"],
+  ["Etica și Securitatea umană", "Etică și securitatea umană"],
+  ["Etică și Securitatea Umană", "Etică și securitatea umană"],
+  ["Etică și Securitatea umană", "Etică și securitatea umană"],
+
+  // 9. Formatting normalization
+  ["Activități Individuale/ În Grup", "Activități Individuale/În Grup"],
+  ["Activități individuale/ în grup", "Activități Individuale/În Grup"],
+
+  // 10. Erroneous semester marker in language subject
+  ["Limba Engleză 1", "Limba engleză"],
+  ["Limba engleză 1", "Limba engleză"],
+  ["Limba Engleza 1", "Limba engleză"],
+  ["Limba engleza 1", "Limba engleză"],
 ]);
 
 /**

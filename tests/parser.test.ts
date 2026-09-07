@@ -417,7 +417,7 @@ describe("subject aliases", () => {
 
     // Non-alias cores are not expanded
     expect(resolveSubjectAlias("A-CDE-X")).toBe("A-CDE-X");
-    expect(resolveSubjectAlias("Fizica 1/l")).toBe("Fizica 1/l");
+    expect(resolveSubjectAlias("Chimie 1/l")).toBe("Chimie 1/l");
   });
 
   it("expands confirmed language abbreviation aliases", () => {
@@ -430,8 +430,14 @@ describe("subject aliases", () => {
     expect(resolveSubjectAlias("L. Străină")).toBe("Limba străină");
     expect(toCanonicalSubjectTitle(resolveSubjectAlias("L. Străină"))).toBe("Limba Străină");
 
-    expect(resolveSubjectAlias("L. Engleză 1")).toBe("Limba engleză 1");
-    expect(toCanonicalSubjectTitle(resolveSubjectAlias("L. Engleză 1"))).toBe("Limba Engleză 1");
+    expect(resolveSubjectAlias("L. Engleză 1")).toBe("Limba engleză");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("L. Engleză 1"))).toBe("Limba Engleză");
+
+    expect(resolveSubjectAlias("L.Engleza 1")).toBe("Limba engleză");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("L.Engleza 1"))).toBe("Limba Engleză");
+
+    expect(resolveSubjectAlias("Limba Engleză 1")).toBe("Limba engleză");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Limba Engleză 1"))).toBe("Limba Engleză");
 
     expect(resolveSubjectAlias("L. Engleză A1")).toBe("Limba engleză A1");
     expect(toCanonicalSubjectTitle(resolveSubjectAlias("L. Engleză A1"))).toBe("Limba Engleză A1");
@@ -467,6 +473,48 @@ describe("subject aliases", () => {
 
     expect(resolveSubjectAlias("Filosofia și Gândirea Critică")).toBe("Filosofie și gândire critică");
     expect(toCanonicalSubjectTitle(resolveSubjectAlias("Filosofia și Gândirea Critică"))).toBe("Filosofie Și Gândire Critică");
+  });
+
+  it("resolves confirmed whole-subject canonical mappings (cases 1-9)", () => {
+    // 1. Dreptul de Proprietate Intelectuală → Dreptul Proprietății Intelectuale
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Dreptul de Proprietate Intelectuală"))).toBe("Dreptul Proprietății Intelectuale");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Dreptul de proprietate intelectuală"))).toBe("Dreptul Proprietății Intelectuale");
+
+    // 2. Proiectarea Conceptelor AS → Proiectarea Conceptuală A Unei Aplicații Software
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Proiectarea Conceptelor AS"))).toBe("Proiectarea Conceptuală A Unei Aplicații Software");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Proiectarea conceptelor AS"))).toBe("Proiectarea Conceptuală A Unei Aplicații Software");
+
+    // 3. Circuite și Dispozitive Electrice → Circuite Și Dispozitive Electronice
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Circuite și Dispozitive Electrice"))).toBe("Circuite Și Dispozitive Electronice");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Circuite și dispozitive electrice"))).toBe("Circuite Și Dispozitive Electronice");
+
+    // 4. Ed. Fizică → Educație Fizică
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Ed. Fizică"))).toBe("Educație Fizică");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Ed. fizică"))).toBe("Educație Fizică");
+
+    // 5. Fizica → Fizică
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Fizica"))).toBe("Fizică");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("fizica"))).toBe("Fizică");
+
+    // 6. Algebră Liniară și Geometrie Analitică → Algebra Liniară Și Geometria Analitică
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Algebră Liniară și Geometrie Analitică"))).toBe("Algebra Liniară Și Geometria Analitică");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Algebră liniară și geometrie analitică"))).toBe("Algebra Liniară Și Geometria Analitică");
+
+    // 7. Etica și Integritatea Academică → Etică Și Integritate Academică
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Etica și Integritatea Academică"))).toBe("Etică Și Integritate Academică");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Etica și integritatea academică"))).toBe("Etică Și Integritate Academică");
+
+    // 8. Security/ethics variants → Etică Și Securitatea Umană
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Etica și Securitate Umană"))).toBe("Etică Și Securitatea Umană");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Etica și securitate umană"))).toBe("Etică Și Securitatea Umană");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Etică și Securitate Umană"))).toBe("Etică Și Securitatea Umană");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Etică și securitate umană"))).toBe("Etică Și Securitatea Umană");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Etica și Securitatea Umană"))).toBe("Etică Și Securitatea Umană");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Etica și securitatea umană"))).toBe("Etică Și Securitatea Umană");
+
+    // 9. Formatting normalization
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Activități Individuale/ În Grup"))).toBe("Activități Individuale/În Grup");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Activități individuale/ în grup"))).toBe("Activități Individuale/În Grup");
   });
 
   it("expands the two abbreviations this timetable misspells", () => {
@@ -1068,5 +1116,145 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     // All 9 critical thinking philosophy lessons now converge to the single canonical title
     const allCritica = schedule.lessons.filter((l) => l.subject === "Filosofie Și Gândire Critică");
     expect(allCritica).toHaveLength(9);
+  });
+
+  it("regression 12: resolves Dreptul de Proprietate Intelectuală to Dreptul Proprietății Intelectuale in Anul II", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const lesson = schedule.lessons.find((l) => l.raw_text.includes("Dreptul de Proprietate Intelectuală"));
+    expect(lesson).toBeDefined();
+    expect(lesson!.subject).toBe("Dreptul Proprietății Intelectuale");
+    expect(lesson!.raw_text).toContain("c. Dreptul de Proprietate Intelectuală");
+    // All 2 intellectual property law lessons converge to the canonical title
+    const allLaw = schedule.lessons.filter((l) => l.subject === "Dreptul Proprietății Intelectuale");
+    expect(allLaw).toHaveLength(2);
+  });
+
+  it("regression 13: resolves Circuite și Dispozitive Electrice to Circuite Și Dispozitive Electronice in Anul II", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const elecLessons = schedule.lessons.filter((l) => l.raw_text.includes("Circuite și Dispozitive Electrice"));
+    expect(elecLessons).toHaveLength(3);
+    for (const l of elecLessons) {
+      expect(l.subject).toBe("Circuite Și Dispozitive Electronice");
+      expect(l.raw_text).toContain("Circuite și Dispozitive Electrice");
+    }
+    // Total CDE lessons in Anul II now equals 29 (26 + 3)
+    const allCde = schedule.lessons.filter((l) => l.subject === "Circuite Și Dispozitive Electronice");
+    expect(allCde).toHaveLength(29);
+  });
+
+  it("regression 14: resolves Proiectarea Conceptelor AS to Proiectarea Conceptuală A Unei Aplicații Software in Anul I", () => {
+    const { schedule } = seedArtifacts;
+    const pcasVar = schedule.lessons.filter((l) => l.raw_text.includes("Proiectarea conceptelor AS"));
+    expect(pcasVar).toHaveLength(2);
+    for (const l of pcasVar) {
+      expect(l.subject).toBe("Proiectarea Conceptuală A Unei Aplicații Software");
+      expect(l.raw_text).toContain("c. Proiectarea conceptelor AS");
+    }
+    const allPcas = schedule.lessons.filter((l) => l.subject === "Proiectarea Conceptuală A Unei Aplicații Software");
+    expect(allPcas).toHaveLength(3);
+  });
+
+  it("regression 15: resolves Ed. Fizică and Fizica to Educație Fizică and Fizică in Anul I", () => {
+    const { schedule } = seedArtifacts;
+
+    // Ed. Fizică -> Educație Fizică (33 total: 27 + 6)
+    const edFiz = schedule.lessons.filter((l) => l.raw_text.toLowerCase().includes("ed. fizică"));
+    expect(edFiz).toHaveLength(27);
+    for (const l of edFiz) {
+      expect(l.subject).toBe("Educație Fizică");
+      expect(l.raw_text.toLowerCase()).toContain("ed. fizică");
+    }
+    const allPe = schedule.lessons.filter((l) => l.subject === "Educație Fizică");
+    expect(allPe).toHaveLength(33);
+
+    // Fizica -> Fizică (26 total: 16 + 10)
+    const fizica = schedule.lessons.filter((l) => l.raw_text.includes("Fizica"));
+    expect(fizica).toHaveLength(16);
+    for (const l of fizica) {
+      expect(l.subject).toBe("Fizică");
+      expect(l.raw_text).toContain("Fizica");
+    }
+    const allFiz = schedule.lessons.filter((l) => l.subject === "Fizică");
+    expect(allFiz).toHaveLength(26);
+  });
+
+  it("regression 16: resolves Algebră Liniară and Etica și Integritatea Academică in Anul I", () => {
+    const { schedule } = seedArtifacts;
+
+    // c. Algebră Liniară și Geometrie Analitică (1 lesson) -> Algebra Liniară Și Geometria Analitică (44 total)
+    const algaVar = schedule.lessons.find((l) => l.raw_text.includes("Algebră Liniară și Geometrie Analitică"));
+    expect(algaVar).toBeDefined();
+    expect(algaVar!.subject).toBe("Algebra Liniară Și Geometria Analitică");
+    expect(algaVar!.raw_text).toContain("c. Algebră Liniară și Geometrie Analitică");
+    const allAlga = schedule.lessons.filter((l) => l.subject === "Algebra Liniară Și Geometria Analitică");
+    expect(allAlga).toHaveLength(44);
+
+    // c. Etica și integritatea academică (1 lesson) -> Etică Și Integritate Academică (9 total)
+    const eiaVar = schedule.lessons.find((l) => l.raw_text.includes("Etica și integritatea academică"));
+    expect(eiaVar).toBeDefined();
+    expect(eiaVar!.subject).toBe("Etică Și Integritate Academică");
+    expect(eiaVar!.raw_text).toContain("c. Etica și integritatea academică");
+    const allEia = schedule.lessons.filter((l) => l.subject === "Etică Și Integritate Academică");
+    expect(allEia).toHaveLength(9);
+  });
+
+  it("regression 17: resolves security/ethics variants and formats Activități in Anul I", () => {
+    const { schedule } = seedArtifacts;
+
+    // All security/ethics variants converge to Etică Și Securitatea Umană (26 total)
+    const allEsu = schedule.lessons.filter((l) => l.subject === "Etică Și Securitatea Umană");
+    expect(allEsu).toHaveLength(26);
+
+    const esuVar1 = schedule.lessons.find((l) => l.raw_text.includes("Etica și Securitate Umană"));
+    expect(esuVar1).toBeDefined();
+    expect(esuVar1!.subject).toBe("Etică Și Securitatea Umană");
+
+    const esuVar2 = schedule.lessons.filter((l) => l.raw_text.includes("Etică și Securitate umană"));
+    expect(esuVar2).toHaveLength(5);
+    for (const l of esuVar2) {
+      expect(l.subject).toBe("Etică Și Securitatea Umană");
+    }
+
+    const esuVar3 = schedule.lessons.filter(
+      (l) => l.raw_text.includes("Etica și securitatea umană") || l.raw_text.includes("Etica și Securitatea umană"),
+    );
+    expect(esuVar3).toHaveLength(6);
+    for (const l of esuVar3) {
+      expect(l.subject).toBe("Etică Și Securitatea Umană");
+    }
+
+    // Activități Individuale/În Grup (4 total)
+    const act = schedule.lessons.filter((l) => l.subject === "Activități Individuale/În Grup");
+    expect(act).toHaveLength(4);
+    for (const l of act) {
+      expect(l.raw_text).toBe("Activități individuale/ în | grup");
+    }
+  });
+
+  it("regression 18: resolves all Limba Engleză 1 lessons to Limba Engleză in Anul I", () => {
+    const { schedule } = seedArtifacts;
+
+    // 6 lessons in Anul I with raw_text starting with L. Engleză 1 or L.Engleza 1
+    const eng1Lessons = schedule.lessons.filter(
+      (l) => l.raw_text.includes("L. Engleză 1") || l.raw_text.includes("L.Engleza 1"),
+    );
+    expect(eng1Lessons).toHaveLength(6);
+    for (const l of eng1Lessons) {
+      expect(l.subject).toBe("Limba Engleză");
+    }
+
+    // Proves raw_text is preserved exactly as printed
+    const sample1 = eng1Lessons.find((l) => l.raw_text.includes("L.Engleza 1"));
+    expect(sample1).toBeDefined();
+    expect(sample1!.raw_text).toBe("L.Engleza 1 | 720/624");
+    expect(sample1!.subject).toBe("Limba Engleză");
+
+    // Total Limba Engleză lessons in Anul I now equals 35 (29 + 6)
+    const allEng = schedule.lessons.filter((l) => l.subject === "Limba Engleză");
+    expect(allEng).toHaveLength(35);
+
+    // No lessons remain with Limba Engleză 1
+    const residual = schedule.lessons.filter((l) => l.subject === "Limba Engleză 1");
+    expect(residual).toHaveLength(0);
   });
 });
