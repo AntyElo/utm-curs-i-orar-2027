@@ -27,16 +27,65 @@ export const SUBJECT_ALIASES = new Map<string, string>([
   ["MD", "Matematica discretă"],
   ["ÎS", "Introducere în specialitate"],
   ["PCAS", "Proiectarea conceptuală a unei aplicații software"],
+
+  // Confirmed Anul II discipline abbreviations
+  ["POO", "Programarea orientată pe obiecte"],
+  ["MS", "Matematici speciale"],
+  ["APA", "Analiza și proiectarea algoritmilor"],
+  ["ASDN", "Analiza și sinteza dispozitivelor numerice"],
+  ["ASCS", "Analiza și specificarea cerințelor software"],
+  ["BD", "Baze de date"],
+  ["BSD", "Bazele statului și dreptului"],
+  ["SCC", "Structuri de calcul și de comunicare"],
+  ["DEMTPI", "Dispozitive electronice și mijloace tehnice de protecție a informației"],
+  ["CEI", "Circuite electronice integrate"],
+  ["TSA", "Teoria sistemelor automate"],
+  ["DNAC", "Dispozitive numerice și arhitecturi de calculatoare"],
+  ["FCS", "Fizica corpului solid"],
+  ["ME", "Măsurări electronice"],
+  ["PADM", "Proiectarea asistată de calculator a dispozitivelor medicale"],
+  ["PAE", "Proiectarea asistată în electronică"],
+  ["AFU", "Anatomia și fiziologia umană"],
+
+  // Confirmed global subject alias
+  ["RC", "Rețele de calculatoare"],
 ]);
 
 /**
- * Abbreviations misspelled in the Autumn 2026 timetable: "ESM" is ESU and "SMM" is SSM.
- * Kept apart from the official dataset on purpose – these are one PDF's typos, not
- * abbreviations UTM publishes. Nothing here guesses: an unknown lookalike stays as printed.
+ * Note on MDPS:
+ * MDPS = "Matematică discretă, Probabilitate și statistică aplicată".
+ * Combined timetable label for two disciplines separate in the study plan;
+ * intentionally preserved as the abbreviation "MDPS" for display per user preference.
+ */
+
+/**
+ * Abbreviations misspelled or truncated in timetables: e.g. "ESM" is ESU and "SMM" is SSM.
+ * Kept apart from the official dataset on purpose – these are PDF typos/variants, not
+ * official abbreviations UTM publishes. Nothing here guesses: an unknown lookalike stays as printed.
  */
 export const KNOWN_SUBJECT_TYPO_ALIASES = new Map<string, string>([
   ["ESM", "Etică și securitatea umană"],
   ["SMM", "Securitatea și sănătatea în muncă"],
+  ["Tehnici de pogramare aplicată", "Tehnici de programare aplicată"],
+
+  // Confirmed Anul II spelling and truncation variants
+  ["Progromarea Orientată pe Obiecte", "Programarea orientată pe obiecte"],
+  ["Programarea Orientată pe Obiect", "Programarea orientată pe obiecte"],
+  ["Filosogie și gândire inginerească", "Filosofie și gândire inginerească"],
+  ["DMETPI", "Dispozitive electronice și mijloace tehnice de protecție a informației"],
+  ["DMTPI", "Dispozitive electronice și mijloace tehnice de protecție a informației"],
+  ["DAAC", "Dispozitive numerice și arhitecturi de calculatoare"],
+  ["AFV", "Anatomia și fiziologia umană"],
+  ["Dispoz. ElecT. MTPI", "Dispozitive electronice și mijloace tehnice de protecție a informației"],
+  ["Struct. Calc. și Comun.", "Structuri de calcul și de comunicare"],
+  ["Măsurări Electr.", "Măsurări electronice"],
+  ["Analiza și Specif. Software", "Analiza și specificarea cerințelor software"],
+  ["Filosofia GC", "Filosofie și gândire critică"],
+  ["Filosofie GC", "Filosofie și gândire critică"],
+  ["Filosofia GI", "Filosofie și gândire inginerească"],
+  ["Filosofie GI", "Filosofie și gândire inginerească"],
+  ["Filosofie și gand. ing.", "Filosofie și gândire inginerească"],
+  ["SCS", "Structuri de calcul și de comunicare"],
 ]);
 
 /**

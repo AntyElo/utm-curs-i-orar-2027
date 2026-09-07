@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import type { Lesson, LessonType, WeekParity } from "@/lib/models";
 import type { TableCell } from "./cell-builder";
-import { normalizeRoom, normalizeSubgroup, normalizeSubject, normalizeTeacher, cleanText } from "./normalizer";
+import { normalizeRoom, normalizeSubgroup, normalizeSubject, normalizeTeacher, toCanonicalSubjectTitle, cleanText } from "./normalizer";
 import { resolveSubjectAlias } from "./subject-aliases";
 
 /** One room: "606", "606a", "3-3", "5-114", "D01", "D-01", "A03" – but not "A1" (language level). */
@@ -210,16 +210,17 @@ export function interpretCell(cell: TableCell): Lesson[] {
     const { type, subject } = classifyType(joinedSubject, segment.leadingType);
     // The abbreviation is expanded once the class-type prefix is off and the text is
     // normalised, so the alias table only ever sees the subject itself.
-    const normalizedSubject = resolveSubjectAlias(normalizeSubject(subject), cell.groups);
-    const hasSubject = normalizedSubject.length > 0;
+    const resolvedSubject = resolveSubjectAlias(normalizeSubject(subject), cell.groups);
+    const canonicalSubject = toCanonicalSubjectTitle(resolvedSubject);
+    const hasSubject = canonicalSubject.length > 0;
     // Uncertain means the *subject* could not be read: it is missing, or it is really a
     // room, or – with no teacher found – a teacher name, so the lines were given the
     // wrong roles. A missing teacher or room is not a parsing failure: that is simply how
     // the timetable prints sports, languages and shared labs.
     const misread =
-      isRoom(normalizedSubject) || isVenue(normalizedSubject) || (segment.teacher === null && isTeacher(normalizedSubject));
+      isRoom(canonicalSubject) || isVenue(canonicalSubject) || (segment.teacher === null && isTeacher(canonicalSubject));
     const uncertain = !hasSubject || misread;
-    const confidence = scoreConfidence(hasSubject, segment, type, normalizedSubject, segments.length);
+    const confidence = scoreConfidence(hasSubject, segment, type, canonicalSubject, segments.length);
 
     lessons.push({
       id: lessonId(cell, index),
@@ -229,7 +230,7 @@ export function interpretCell(cell: TableCell): Lesson[] {
       start_time: firstRow.start_time,
       end_time: lastRow.end_time,
       groups: cell.groups,
-      subject: hasSubject ? normalizedSubject : rawText || "Nerecunoscut",
+      subject: hasSubject ? canonicalSubject : rawText || "Nerecunoscut",
       teacher: segment.teacher,
       room: segment.room,
       lesson_type: type,

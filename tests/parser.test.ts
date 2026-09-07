@@ -4,7 +4,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { buildGrid, mergeSegments } from "@/lib/parser/geometry";
 import { buildCells, rowsCoveredBy, groupsCoveredBy } from "@/lib/parser/cell-builder";
 import { classifyType, isRoom, isTeacher, isVenue, segmentLines } from "@/lib/parser/lesson-interpreter";
-import { normalizeRoom, normalizeSubgroup, normalizeTeacher, normalizeTime } from "@/lib/parser/normalizer";
+import { normalizeRoom, normalizeSubgroup, normalizeTeacher, normalizeTime, toCanonicalSubjectTitle } from "@/lib/parser/normalizer";
 import { resolveSubjectAlias } from "@/lib/parser/subject-aliases";
 import { extractPages, type PageExtraction } from "@/lib/parser/pdf-extract";
 import { detectDays, detectGroups, detectLayout, detectSlotRows } from "@/lib/parser/table-detector";
@@ -271,6 +271,38 @@ describe("teacher recognition", () => {
   });
 });
 
+describe("canonical subject title helper", () => {
+  it("capitalizes each lexical word while preserving token remainder", () => {
+    expect(toCanonicalSubjectTitle("Analiza și proiectarea algoritmilor")).toBe("Analiza Și Proiectarea Algoritmilor");
+    expect(toCanonicalSubjectTitle("Programarea orientată pe obiecte")).toBe("Programarea Orientată Pe Obiecte");
+    expect(toCanonicalSubjectTitle("Proiectarea asistată de calculator a dispozitivelor medicale")).toBe(
+      "Proiectarea Asistată De Calculator A Dispozitivelor Medicale",
+    );
+    expect(toCanonicalSubjectTitle("TWeb")).toBe("TWeb");
+    expect(toCanonicalSubjectTitle("UX/UI")).toBe("UX/UI");
+    expect(toCanonicalSubjectTitle("POO")).toBe("POO");
+    expect(toCanonicalSubjectTitle("1) CDE")).toBe("1) CDE");
+    expect(toCanonicalSubjectTitle("II")).toBe("II");
+    expect(toCanonicalSubjectTitle("și")).toBe("Și");
+    expect(toCanonicalSubjectTitle("de")).toBe("De");
+    expect(toCanonicalSubjectTitle("obiecte")).toBe("Obiecte");
+  });
+
+  it("handles Romanian diacritics and function words correctly", () => {
+    expect(toCanonicalSubjectTitle("în")).toBe("În");
+    expect(toCanonicalSubjectTitle("pe")).toBe("Pe");
+    expect(toCanonicalSubjectTitle("a")).toBe("A");
+    expect(toCanonicalSubjectTitle("al")).toBe("Al");
+    expect(toCanonicalSubjectTitle("de")).toBe("De");
+    expect(toCanonicalSubjectTitle("din")).toBe("Din");
+    expect(toCanonicalSubjectTitle("cu")).toBe("Cu");
+    expect(toCanonicalSubjectTitle("pentru")).toBe("Pentru");
+    expect(toCanonicalSubjectTitle("unei")).toBe("Unei");
+    expect(toCanonicalSubjectTitle("etică și integritate academică")).toBe("Etică Și Integritate Academică");
+    expect(toCanonicalSubjectTitle("activități individuale/ în grup")).toBe("Activități Individuale/ În Grup");
+  });
+});
+
 describe("subject aliases", () => {
   it("expands the abbreviations UTM uses in the grid", () => {
     expect(resolveSubjectAlias("AM")).toBe("Analiza matematică");
@@ -288,6 +320,67 @@ describe("subject aliases", () => {
     expect(resolveSubjectAlias("ÎS")).toBe("Introducere în specialitate");
   });
 
+  it("expands confirmed Anul II abbreviations", () => {
+    expect(resolveSubjectAlias("POO")).toBe("Programarea orientată pe obiecte");
+    expect(resolveSubjectAlias("MS")).toBe("Matematici speciale");
+    expect(resolveSubjectAlias("APA")).toBe("Analiza și proiectarea algoritmilor");
+    expect(resolveSubjectAlias("ASDN")).toBe("Analiza și sinteza dispozitivelor numerice");
+    expect(resolveSubjectAlias("ASCS")).toBe("Analiza și specificarea cerințelor software");
+    expect(resolveSubjectAlias("BD")).toBe("Baze de date");
+    expect(resolveSubjectAlias("BSD")).toBe("Bazele statului și dreptului");
+    expect(resolveSubjectAlias("SCC")).toBe("Structuri de calcul și de comunicare");
+    expect(resolveSubjectAlias("DEMTPI")).toBe("Dispozitive electronice și mijloace tehnice de protecție a informației");
+    expect(resolveSubjectAlias("CEI")).toBe("Circuite electronice integrate");
+    expect(resolveSubjectAlias("TSA")).toBe("Teoria sistemelor automate");
+    expect(resolveSubjectAlias("DNAC")).toBe("Dispozitive numerice și arhitecturi de calculatoare");
+    expect(resolveSubjectAlias("FCS")).toBe("Fizica corpului solid");
+    expect(resolveSubjectAlias("ME")).toBe("Măsurări electronice");
+    expect(resolveSubjectAlias("PADM")).toBe("Proiectarea asistată de calculator a dispozitivelor medicale");
+    expect(resolveSubjectAlias("PAE")).toBe("Proiectarea asistată în electronică");
+    expect(resolveSubjectAlias("AFU")).toBe("Anatomia și fiziologia umană");
+  });
+
+  it("expands confirmed Anul II spelling and truncation variants", () => {
+    expect(resolveSubjectAlias("Progromarea Orientată pe Obiecte")).toBe("Programarea orientată pe obiecte");
+    expect(resolveSubjectAlias("Programarea Orientată pe Obiect")).toBe("Programarea orientată pe obiecte");
+    expect(resolveSubjectAlias("Filosogie și gândire inginerească")).toBe("Filosofie și gândire inginerească");
+    expect(resolveSubjectAlias("DMETPI")).toBe("Dispozitive electronice și mijloace tehnice de protecție a informației");
+    expect(resolveSubjectAlias("DMTPI")).toBe("Dispozitive electronice și mijloace tehnice de protecție a informației");
+    expect(resolveSubjectAlias("DAAC")).toBe("Dispozitive numerice și arhitecturi de calculatoare");
+    expect(resolveSubjectAlias("AFV")).toBe("Anatomia și fiziologia umană");
+    expect(resolveSubjectAlias("Dispoz. ElecT. MTPI")).toBe("Dispozitive electronice și mijloace tehnice de protecție a informației");
+    expect(resolveSubjectAlias("Struct. Calc. și Comun.")).toBe("Structuri de calcul și de comunicare");
+    expect(resolveSubjectAlias("Măsurări Electr.")).toBe("Măsurări electronice");
+    expect(resolveSubjectAlias("Analiza și Specif. Software")).toBe("Analiza și specificarea cerințelor software");
+    expect(resolveSubjectAlias("Filosofia GC")).toBe("Filosofie și gândire critică");
+    expect(resolveSubjectAlias("Filosofie GC")).toBe("Filosofie și gândire critică");
+    expect(resolveSubjectAlias("Filosofia GI")).toBe("Filosofie și gândire inginerească");
+    expect(resolveSubjectAlias("Filosofie GI")).toBe("Filosofie și gândire inginerească");
+    expect(resolveSubjectAlias("Filosofie și gand. ing.")).toBe("Filosofie și gândire inginerească");
+  });
+
+  it("expands confirmed RC alias", () => {
+    expect(resolveSubjectAlias("RC")).toBe("Rețele de calculatoare");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("RC"))).toBe("Rețele De Calculatoare");
+  });
+
+  it("expands confirmed Tehnici de pogramare aplicată typo variant", () => {
+    expect(resolveSubjectAlias("Tehnici de pogramare aplicată")).toBe("Tehnici de programare aplicată");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Tehnici de pogramare aplicată"))).toBe("Tehnici De Programare Aplicată");
+  });
+
+  it("intentionally preserves MDPS as abbreviation for display", () => {
+    // MDPS = "Matematică discretă, Probabilitate și statistică aplicată"
+    // Intentionally kept as abbreviation for display per user preference, not an unresolved alias.
+    expect(resolveSubjectAlias("MDPS")).toBe("MDPS");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("MDPS"))).toBe("MDPS");
+  });
+
+  it("expands confirmed SCS typo to Structuri de calcul și de comunicare", () => {
+    expect(resolveSubjectAlias("SCS")).toBe("Structuri de calcul și de comunicare");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("SCS"))).toBe("Structuri De Calcul Și De Comunicare");
+  });
+
   it("expands the two abbreviations this timetable misspells", () => {
     expect(resolveSubjectAlias("ESM")).toBe("Etică și securitatea umană");
     expect(resolveSubjectAlias("SMM")).toBe("Securitatea și sănătatea în muncă");
@@ -301,9 +394,6 @@ describe("subject aliases", () => {
 
   it("leaves anything it was not told about exactly as printed", () => {
     expect(resolveSubjectAlias("XYZ")).toBe("XYZ");
-    // Abbreviations nobody confirmed keep their abbreviation rather than a guessed name.
-    expect(resolveSubjectAlias("MDPS")).toBe("MDPS");
-    expect(resolveSubjectAlias("RC")).toBe("RC");
     // Already-full names pass through untouched.
     expect(resolveSubjectAlias("Analiza matematică")).toBe("Analiza matematică");
     expect(resolveSubjectAlias("Programarea calculatoarelor")).toBe("Programarea calculatoarelor");
@@ -391,7 +481,7 @@ describe("test_merged_lectures_reach_every_group", () => {
     expect(split).toMatchObject({ subject: "Criptografie", teacher: "Reșetnicov M.", room: "D02/04", uncertain: false });
 
     const patron = byRaw("c. Tehnici de Programare | Roșca V. | 3-3 Amdaris");
-    expect(patron).toMatchObject({ subject: "Tehnici de Programare", room: "3-3 Amdaris", lesson_type: "lecture" });
+    expect(patron).toMatchObject({ subject: "Tehnici De Programare", room: "3-3 Amdaris", lesson_type: "lecture" });
 
     const sports = byRaw("Educație fizică | Sala sportivă");
     expect(sports).toMatchObject({ lesson_type: "physical_education", room: "Sala sportivă", uncertain: false });
@@ -415,7 +505,7 @@ describe("autumn 2026 packaged-seed regression", () => {
     // the surname-first spelling was recognised.
     const lesson = seedLesson("Marți", "13:30", "IA-261", "ESU | P. Russu | 401");
     expect(lesson).toMatchObject({
-      subject: "Etică și securitatea umană",
+      subject: "Etică Și Securitatea Umană",
       teacher: "P. Russu",
       room: "401",
       uncertain: false,
@@ -425,7 +515,7 @@ describe("autumn 2026 packaged-seed regression", () => {
 
     // The same teacher without the space after the initial.
     const noSpace = seedLesson("Joi", "11:30", "IA-261", "ESU | P.Russu | 614");
-    expect(noSpace).toMatchObject({ subject: "Etică și securitatea umană", teacher: "P. Russu", room: "614" });
+    expect(noSpace).toMatchObject({ subject: "Etică Și Securitatea Umană", teacher: "P. Russu", room: "614" });
 
     expect(seedArtifacts.schedule.lessons.filter((lesson) => /Russu/.test(lesson.raw_text))).toHaveLength(8);
     for (const lesson of seedArtifacts.schedule.lessons.filter((l) => /Russu/.test(l.raw_text))) {
@@ -435,10 +525,10 @@ describe("autumn 2026 packaged-seed regression", () => {
 
   it("expands the abbreviated subjects without touching the printed text", () => {
     const cases = [
-      { day: "Vineri", time: "11:30", group: "R-262", raw: "AM | Orlov V. | 515", subject: "Analiza matematică", teacher: "Orlov V.", room: "515" },
-      { day: "Luni", time: "09:45", group: "SI-261", raw: "ALGA | Stanciu L. | 611", subject: "Algebra liniară și geometria analitică", teacher: "Stanciu L.", room: "611" },
-      { day: "Miercuri", time: "08:00", group: "SI-261", raw: "PC | Danilov I. | 628", subject: "Programarea calculatoarelor", teacher: "Danilov I.", room: "628" },
-      { day: "Luni", time: "13:30", group: "TI-262", raw: "lab. 0.5 gr. CDE | Litra D. | A03", subject: "Circuite și dispozitive electronice", teacher: "Litra D.", room: "A03" },
+      { day: "Vineri", time: "11:30", group: "R-262", raw: "AM | Orlov V. | 515", subject: "Analiza Matematică", teacher: "Orlov V.", room: "515" },
+      { day: "Luni", time: "09:45", group: "SI-261", raw: "ALGA | Stanciu L. | 611", subject: "Algebra Liniară Și Geometria Analitică", teacher: "Stanciu L.", room: "611" },
+      { day: "Miercuri", time: "08:00", group: "SI-261", raw: "PC | Danilov I. | 628", subject: "Programarea Calculatoarelor", teacher: "Danilov I.", room: "628" },
+      { day: "Luni", time: "13:30", group: "TI-262", raw: "lab. 0.5 gr. CDE | Litra D. | A03", subject: "Circuite Și Dispozitive Electronice", teacher: "Litra D.", room: "A03" },
     ];
     for (const sample of cases) {
       const lesson = seedLesson(sample.day, sample.time, sample.group, sample.raw);
@@ -459,6 +549,15 @@ describe("autumn 2026 packaged-seed regression", () => {
     const abbreviations = new Set(["AM", "ALGA", "PC", "TP", "TPA", "CDE", "ICPP", "ESU", "EIA", "SSM", "SSM.", "MD", "ÎS", "ESM", "SMM"]);
     const unexpanded = seedArtifacts.schedule.lessons.filter((lesson) => abbreviations.has(lesson.subject));
     expect(unexpanded.map((lesson) => lesson.raw_text)).toEqual([]);
+  });
+
+  it("resolves the Tehnici de pogramare aplicată typo to canonical subject while raw_text preserves the source typo", () => {
+    const typoLessons = seedArtifacts.schedule.lessons.filter((l) => l.raw_text.includes("pogramare"));
+    expect(typoLessons).toHaveLength(2);
+    for (const lesson of typoLessons) {
+      expect(lesson.subject).toBe("Tehnici De Programare Aplicată");
+      expect(lesson.raw_text).toContain("pogramare");
+    }
   });
 });
 
@@ -482,6 +581,23 @@ describe("regression fixture", () => {
       expect(found!.lesson_type).toBe(sample.lesson_type);
       expect(found!.week_parity).toBe(sample.week_parity);
       expect(found!.groups.length, JSON.stringify(sample)).toBe(sample.group_count);
+    }
+  });
+
+  it("resolves RC to Rețele De Calculatoare while raw_text preserves RC", () => {
+    const rcLessons = artifacts.schedule.lessons.filter((l) => l.raw_text.includes("RC"));
+    expect(rcLessons).toHaveLength(22);
+    for (const lesson of rcLessons) {
+      expect(lesson.subject).toBe("Rețele De Calculatoare");
+      expect(lesson.raw_text).toMatch(/\bRC\b/);
+    }
+  });
+
+  it("preserves MDPS displayed as MDPS in lessons", () => {
+    const mdpsLessons = artifacts.schedule.lessons.filter((l) => l.raw_text.includes("MDPS"));
+    expect(mdpsLessons.length).toBeGreaterThan(0);
+    for (const lesson of mdpsLessons) {
+      expect(lesson.subject).toBe("MDPS");
     }
   });
 });
@@ -512,7 +628,7 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     const ti = tues1845.find((l) => l.groups.includes("TI-251"));
     expect(ti).toBeDefined();
     expect(ti!.groups).toEqual(["TI-251", "TI-252", "TI-253", "TI-254"]);
-    expect(ti!.subject).toBe("Programarea Orientată pe Obiecte");
+    expect(ti!.subject).toBe("Programarea Orientată Pe Obiecte");
     expect(ti!.teacher).toBe("Gîncu S.");
     expect(ti!.room).toBe("6-2");
     expect(ti!.lesson_type).toBe("lecture");
@@ -520,7 +636,7 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     const si = tues1845.find((l) => l.groups.includes("SI-251"));
     expect(si).toBeDefined();
     expect(si!.groups).toEqual(["SI-251", "SI-252"]);
-    expect(si!.subject).toBe("POO");
+    expect(si!.subject).toBe("Programarea Orientată Pe Obiecte");
     expect(si!.teacher).toBe("Gîncu S.");
     expect(si!.room).toBe("6-2");
     expect(si!.lesson_type).toBe("lecture");
@@ -544,7 +660,7 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     // Odd half-cell: CR-251 Luni 08:00 Circuite și dispozitive electronice Chiriac M. A03 odd
     const cdeOdd = schedule.lessons.find((l) => l.day === "Luni" && l.start_time === "08:00" && l.groups.includes("CR-251"));
     expect(cdeOdd).toMatchObject({
-      subject: "Circuite și dispozitive electronice",
+      subject: "Circuite Și Dispozitive Electronice",
       teacher: "Chiriac M.",
       room: "A03",
       week_parity: "odd",
@@ -552,10 +668,10 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
 
     // Even half-cell: AI-252 Luni 09:45 TSA Izvoreanu B. 524 even
     const tsaEven = schedule.lessons.find(
-      (l) => l.day === "Luni" && l.start_time === "09:45" && l.groups.includes("AI-252") && l.subject === "TSA",
+      (l) => l.day === "Luni" && l.start_time === "09:45" && l.groups.includes("AI-252") && l.subject === "Teoria Sistemelor Automate",
     );
     expect(tsaEven).toMatchObject({
-      subject: "TSA",
+      subject: "Teoria Sistemelor Automate",
       teacher: "Izvoreanu B.",
       room: "524",
       week_parity: "even",
@@ -574,10 +690,132 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     // Normal single-group lesson: AI-252 Miercuri 13:30 CEI Moraru D. 524
     const cei = schedule.lessons.find((l) => l.day === "Miercuri" && l.start_time === "13:30" && l.groups.includes("AI-252"));
     expect(cei).toMatchObject({
-      subject: "CEI",
+      subject: "Circuite Electronice Integrate",
       teacher: "Moraru D.",
       room: "524",
       groups: ["AI-252"],
     });
+  });
+
+  it("expands representative Anul II abbreviations in the real PDF to canonical title case", () => {
+    const { schedule } = seedArtifactsAnulII;
+
+    // POO → Programarea Orientată Pe Obiecte
+    const poo = schedule.lessons.find((l) => l.raw_text.startsWith("POO |"));
+    expect(poo).toBeDefined();
+    expect(poo!.subject).toBe("Programarea Orientată Pe Obiecte");
+
+    // MS → Matematici Speciale
+    const ms = schedule.lessons.find((l) => l.raw_text.startsWith("MS | Pricop V."));
+    expect(ms).toBeDefined();
+    expect(ms!.subject).toBe("Matematici Speciale");
+
+    // APA → Analiza Și Proiectarea Algoritmilor
+    const apa = schedule.lessons.find((l) => l.raw_text.startsWith("APA |"));
+    expect(apa).toBeDefined();
+    expect(apa!.subject).toBe("Analiza Și Proiectarea Algoritmilor");
+
+    // SCC → Structuri De Calcul Și De Comunicare
+    const scc = schedule.lessons.find((l) => l.raw_text.startsWith("SCC |"));
+    expect(scc).toBeDefined();
+    expect(scc!.subject).toBe("Structuri De Calcul Și De Comunicare");
+
+    // DEMTPI → Dispozitive Electronice Și Mijloace Tehnice De Protecție A Informației
+    const demtpi = schedule.lessons.find((l) => l.raw_text.startsWith("DEMTPI |"));
+    expect(demtpi).toBeDefined();
+    expect(demtpi!.subject).toBe("Dispozitive Electronice Și Mijloace Tehnice De Protecție A Informației");
+
+    // CEI → Circuite Electronice Integrate
+    const cei = schedule.lessons.find((l) => l.raw_text.includes("CEI |"));
+    expect(cei).toBeDefined();
+    expect(cei!.subject).toBe("Circuite Electronice Integrate");
+
+    // TSA → Teoria Sistemelor Automate
+    const tsa = schedule.lessons.find((l) => l.raw_text.startsWith("TSA |"));
+    expect(tsa).toBeDefined();
+    expect(tsa!.subject).toBe("Teoria Sistemelor Automate");
+
+    // DNAC → Dispozitive Numerice Și Arhitecturi De Calculatoare
+    const dnac = schedule.lessons.find((l) => l.raw_text.startsWith("DNAC |"));
+    expect(dnac).toBeDefined();
+    expect(dnac!.subject).toBe("Dispozitive Numerice Și Arhitecturi De Calculatoare");
+
+    // AFU → Anatomia Și Fiziologia Umană
+    const afu = schedule.lessons.find((l) => l.raw_text.includes("AFU |"));
+    expect(afu).toBeDefined();
+    expect(afu!.subject).toBe("Anatomia Și Fiziologia Umană");
+
+    // PADM → Proiectarea Asistată De Calculator A Dispozitivelor Medicale
+    const padm = schedule.lessons.find((l) => l.raw_text.includes("PADM 0,5 gr. |"));
+    expect(padm).toBeDefined();
+    expect(padm!.subject).toBe("Proiectarea Asistată De Calculator A Dispozitivelor Medicale");
+  });
+
+  it("resolves SCS typo in R-251 Vineri 13:30 to Structuri De Calcul Și De Comunicare while raw_text preserves SCS", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const scsLesson = schedule.lessons.find(
+      (l) => l.day === "Vineri" && l.start_time === "13:30" && l.groups.includes("R-251"),
+    );
+    expect(scsLesson).toBeDefined();
+    expect(scsLesson!.subject).toBe("Structuri De Calcul Și De Comunicare");
+    expect(scsLesson!.teacher).toBe("Munteanu S.");
+    expect(scsLesson!.room).toBe("215");
+    expect(scsLesson!.raw_text).toBe("SCS | Munteanu S. | 215");
+    expect(scsLesson!.raw_text).toContain("SCS");
+
+    // Verify all SCC lessons resolve to exactly the same canonical subject
+    const sccLessons = schedule.lessons.filter((l) => l.raw_text.startsWith("SCC |"));
+    expect(sccLessons.length).toBeGreaterThan(0);
+    for (const l of sccLessons) {
+      expect(l.subject).toBe("Structuri De Calcul Și De Comunicare");
+    }
+
+    // Total Structuri De Calcul Și De Comunicare lessons: 13 (SCC/Struct.) + 1 (SCS) = 14
+    const allStructuri = schedule.lessons.filter((l) => l.subject === "Structuri De Calcul Și De Comunicare");
+    expect(allStructuri).toHaveLength(14);
+  });
+
+  it("leaves no confirmed bare abbreviation as a standalone final subject", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const confirmedBare = new Set([
+      "POO",
+      "MS",
+      "APA",
+      "ASDN",
+      "ASCS",
+      "BD",
+      "BSD",
+      "SCC",
+      "DEMTPI",
+      "CEI",
+      "TSA",
+      "DNAC",
+      "FCS",
+      "ME",
+      "PADM",
+      "PAE",
+      "AFU",
+      "CDE",
+    ]);
+
+    const unexpanded = schedule.lessons.filter((lesson) => confirmedBare.has(lesson.subject));
+    expect(unexpanded).toHaveLength(0);
+
+    // Residual anomalies survive with their distinct non-bare labels
+    const residualAnomalies = schedule.lessons
+      .filter((l) => Array.from(confirmedBare).some((abbr) => l.subject.includes(abbr)))
+      .map((l) => l.subject);
+    const uniqueResidual = Array.from(new Set(residualAnomalies)).sort();
+    expect(uniqueResidual).toEqual([
+      "1) CDE",
+      "2) MS",
+      "CDE Bîrnaz",
+      "Lab.PAE",
+      "MS L. Stanciu",
+      "PADM 1/e",
+      "PADM 1/l",
+      "PAE 1/l",
+      "PAE BÎrnaz A.",
+    ]);
   });
 });

@@ -61,3 +61,21 @@ export function normalizeSubject(raw: string): string {
   if (!cleaned) return cleaned;
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
+
+/**
+ * Canonical Subject Title Case:
+ * Capitalises each lexical word while preserving the remainder of the token.
+ * E.g., "și" → "Și", "TWeb" → "TWeb", "UX/UI" → "UX/UI", "1) CDE" → "1) CDE".
+ * Uppercases the first alphabetic character while leaving the rest unchanged.
+ */
+export function toCanonicalSubjectTitle(raw: string): string {
+  const cleaned = cleanText(raw);
+  if (!cleaned) return cleaned;
+  return cleaned
+    .split(" ")
+    .map((token) => {
+      if (/^\d/.test(token)) return token;
+      return token.replace(/\p{L}/u, (char) => char.toUpperCase());
+    })
+    .join(" ");
+}
