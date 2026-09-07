@@ -3,10 +3,9 @@
  * chair uses in the grid ("AM"), sometimes both within one timetable. Expanding the
  * abbreviation gives every lesson one canonical `subject`; `raw_text` keeps the PDF's
  * own wording untouched.
- *
  * Resolution is an exact match on the whole cleaned subject – never a substring
  * replacement – so "AM" expands while "Amdaris" or "TWeb" are left exactly as printed,
- * and an abbreviation nobody confirmed ("MDPS", "RC") stays an abbreviation.
+ * and an abbreviation nobody confirmed stays an abbreviation.
  */
 
 /** Official abbreviations, expanded to the Romanian names UTM uses for the same courses. */
@@ -47,16 +46,23 @@ export const SUBJECT_ALIASES = new Map<string, string>([
   ["PAE", "Proiectarea asistată în electronică"],
   ["AFU", "Anatomia și fiziologia umană"],
 
-  // Confirmed global subject alias
+  // Confirmed global subject aliases
   ["RC", "Rețele de calculatoare"],
-]);
+  ["MDPS", "Matematică discretă, probabilitate și statistică aplicată"],
 
-/**
- * Note on MDPS:
- * MDPS = "Matematică discretă, Probabilitate și statistică aplicată".
- * Combined timetable label for two disciplines separate in the study plan;
- * intentionally preserved as the abbreviation "MDPS" for display per user preference.
- */
+  // Confirmed language expansions
+  ["L. Engleză", "Limba engleză"],
+  ["L.Engleză", "Limba engleză"],
+  ["L. engleză", "Limba engleză"],
+  ["L. Română", "Limba română"],
+  ["L.Română", "Limba română"],
+  ["L. Străină", "Limba străină"],
+  ["L. Engleză 1", "Limba engleză 1"],
+  ["L.Engleza 1", "Limba engleză 1"],
+  ["L. Engleză A1", "Limba engleză A1"],
+  ["L.Engleză A1", "Limba engleză A1"],
+  ["L. engleză A1", "Limba engleză A1"],
+]);
 
 /**
  * Abbreviations misspelled or truncated in timetables: e.g. "ESM" is ESU and "SMM" is SSM.
@@ -82,10 +88,22 @@ export const KNOWN_SUBJECT_TYPO_ALIASES = new Map<string, string>([
   ["Analiza și Specif. Software", "Analiza și specificarea cerințelor software"],
   ["Filosofia GC", "Filosofie și gândire critică"],
   ["Filosofie GC", "Filosofie și gândire critică"],
+  ["Filosofia și Gândire Critică", "Filosofie și gândire critică"],
+  ["Filosofia și gândire critică", "Filosofie și gândire critică"],
+  ["Filosofia și Gândirea Critică", "Filosofie și gândire critică"],
+  ["Filosofia și gândirea critică", "Filosofie și gândire critică"],
   ["Filosofia GI", "Filosofie și gândire inginerească"],
   ["Filosofie GI", "Filosofie și gândire inginerească"],
   ["Filosofie și gand. ing.", "Filosofie și gândire inginerească"],
   ["SCS", "Structuri de calcul și de comunicare"],
+
+  // Embedded SI subject abbreviation (not global SI code)
+  ["Cadrul Legal al SI", "Cadrul Legal al Securității Informaționale"],
+  ["Cadrul legal al SI", "Cadrul Legal al Securității Informaționale"],
+
+  // Language typo / truncation variants
+  ["L. Rom.", "Limba română"],
+  ["L.Rom", "Limba română"],
 ]);
 
 /**
@@ -96,6 +114,13 @@ export const KNOWN_SUBJECT_TYPO_ALIASES = new Map<string, string>([
 const GROUP_SCOPED_ALIASES: { alias: string; expansion: string; groups: RegExp }[] = [
   { alias: "EA", expansion: "Engleza în afaceri", groups: /^FAF-/i },
 ];
+
+/**
+ * Recognized prefix/suffix decorations around subject abbreviations:
+ * e.g. "1) CDE", "2) MS", "PAE 1/l", "PADM 1/e".
+ * Preserves the exact decoration marker while expanding only the confirmed central alias core.
+ */
+const DECORATED_ALIAS_RE = /^(?:(\d+\)\s*))?([A-Za-zĂÂÎȘȚăâîșț0-9.-]+)(?:\s+((?:1\/[le]|\d+\/[a-z]+)))?$/;
 
 /**
  * Expand a subject abbreviation to its canonical name, or return it unchanged.
@@ -109,5 +134,19 @@ export function resolveSubjectAlias(subject: string, groups: readonly string[] =
   const scoped = GROUP_SCOPED_ALIASES.find((entry) => entry.alias === key);
   if (scoped) return groups.some((group) => scoped.groups.test(group)) ? scoped.expansion : subject;
 
-  return SUBJECT_ALIASES.get(key) ?? KNOWN_SUBJECT_TYPO_ALIASES.get(key) ?? subject;
+  const direct = SUBJECT_ALIASES.get(key) ?? KNOWN_SUBJECT_TYPO_ALIASES.get(key);
+  if (direct) return direct;
+
+  const match = DECORATED_ALIAS_RE.exec(key);
+  if (match) {
+    const [, prefix = "", core, suffix = ""] = match;
+    if (prefix || suffix) {
+      const coreExpansion = resolveSubjectAlias(core, groups);
+      if (coreExpansion !== core) {
+        return `${prefix}${coreExpansion}${suffix ? ` ${suffix}` : ""}`;
+      }
+    }
+  }
+
+  return subject;
 }

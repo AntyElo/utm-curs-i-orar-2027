@@ -30,13 +30,41 @@ export function cleanText(raw: string): string {
     .trim();
 }
 
-/** "Costaș A" → "Costaș A." ; "Prozor-Barbalat l." → "Prozor-Barbalat L." */
-export function normalizeTeacher(raw: string): string {
-  const cleaned = cleanText(raw).replace(/\s*\.\s*/g, ". ").replace(/\s+$/, "").trim();
+/** Evidence-backed teacher variants where timetable cells omit initials or misspell names. */
+export const KNOWN_TEACHER_ALIASES = new Map<string, string>([
+  ["Bîrnaz", "Bîrnaz A."],
+  ["BÎrnaz A.", "Bîrnaz A."],
+]);
+
+function normalizeSingleTeacher(raw: string): string {
+  const trimmed = raw.trim();
+  if (KNOWN_TEACHER_ALIASES.has(trimmed)) {
+    return KNOWN_TEACHER_ALIASES.get(trimmed)!;
+  }
+  const cleaned = cleanText(trimmed).replace(/\s*\.\s*/g, ". ").replace(/\s+$/, "").trim();
   const match = /^(.+?)\s+([A-Za-zĂÂÎȘȚăâîșț]{1,3})\.?$/.exec(cleaned);
   if (!match) return cleaned;
   const initials = match[2].charAt(0).toUpperCase() + match[2].slice(1);
   return `${match[1]} ${initials}.`;
+}
+
+/** "Costaș A" → "Costaș A." ; "Prozor-Barbalat l." → "Prozor-Barbalat L." ; "Bostan V. ; Cojuhari E." → "Bostan V.; Cojuhari E." */
+export function normalizeTeacher(raw: string): string {
+  if (raw.includes(";")) {
+    return raw
+      .split(";")
+      .map((part) => normalizeSingleTeacher(part))
+      .filter((part) => part.length > 0)
+      .join("; ");
+  }
+  if (raw.includes(",")) {
+    return raw
+      .split(",")
+      .map((part) => normalizeSingleTeacher(part))
+      .filter((part) => part.length > 0)
+      .join(", ");
+  }
+  return normalizeSingleTeacher(raw);
 }
 
 /** "D 01-03" → "D01-03", "5 - 114" → "5-114", "D-01 / D-03" → "D-01/D-03" */

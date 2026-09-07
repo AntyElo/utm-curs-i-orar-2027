@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import type { Lesson, LessonType, WeekParity } from "@/lib/models";
 import type { TableCell } from "./cell-builder";
-import { normalizeRoom, normalizeSubgroup, normalizeSubject, normalizeTeacher, toCanonicalSubjectTitle, cleanText } from "./normalizer";
+import { normalizeRoom, normalizeSubgroup, normalizeSubject, normalizeTeacher, toCanonicalSubjectTitle, cleanText, KNOWN_TEACHER_ALIASES } from "./normalizer";
 import { resolveSubjectAlias } from "./subject-aliases";
 
 /** One room: "606", "606a", "3-3", "5-114", "D01", "D-01", "A03" – but not "A1" (language level). */
@@ -27,15 +27,14 @@ const VENUE_ROOM_RE = new RegExp(`^(?:(?:aula|sala|sală)\\s+)?${ROOM_ATOM}(?:\\
 const NAMED_VENUE_RE = /^(?:sal[aă]|aul[aă]|teren(?:ul)?|stadion(?:ul)?)\s+[A-Za-zĂÂÎȘȚăâîșț][A-Za-zĂÂÎȘȚăâîșț\s.-]*$/i;
 const NAME_WORD = "[A-ZĂÂÎȘȚ][a-zăâîșț]+(?:-[A-Za-zĂÂÎȘȚăâîșț][a-zăâîșț]+)?";
 const TEACHER_RE = new RegExp(`^${NAME_WORD}(?: ${NAME_WORD})?\\s+(?:[A-ZĂÂÎȘȚ][a-zăâîșț]{0,2}\\.?|[a-z]\\.)$`);
-/** A few cells put the initial first instead: "P. Russu", "P.Russu". */
+/** A few cells put the initial first instead: "P. Russu", "P.Russu", "L. Stanciu". */
 const INITIAL_FIRST_TEACHER_RE = new RegExp(`^[A-ZĂÂÎȘȚ]\\.\\s?${NAME_WORD}$`);
 /**
- * That same shape spells an abbreviated *subject* far more often than a name: "L. Engleză"
- * (limba), "C. Fizica" (curs), "T. Web" (tehnologii). Those three initials never introduce a
- * teacher in these timetables, and missing a teacher is far cheaper than filing a subject as
- * one – the surname-first form covers every other teacher on the page.
+ * Initial-first abbreviations for subjects: "C. Fizica" (curs), "T. Web" (tehnologii).
+ * Language abbreviations starting with "L." ("L. Engleză") are excluded by LANGUAGE_RE,
+ * allowing legitimate initial-first teachers such as "L. Stanciu" to be recognized.
  */
-const SUBJECT_INITIAL_RE = /^[clt]\s*\./i;
+const SUBJECT_INITIAL_RE = /^[ct]\s*\./i;
 const SUBGROUP_RE = /(?:\b0\s*[.,]\s*5\s*[,.]?\s*gr\.?|\b05\s*,\s*gr\.?)/i;
 const LONE_MARKER_RE = /^(c|lab|sem|pr|proiect)\.?$/i;
 const PHYS_ED_RE = /^(?:ed\.?|educa[țt]i[ae])\s*fizic[aă](?![a-zăâîșț])/i;
@@ -46,10 +45,10 @@ const SELF_STUDY_RE = /^(?:activit[ăa][țt]i|lucru\s+individual|studiu\s+indivi
 const TYPE_PREFIXES: { pattern: RegExp; type: LessonType }[] = [
   { pattern: /^c\.\s*/i, type: "lecture" },
   { pattern: /^curs\b\.?\s*/i, type: "lecture" },
-  { pattern: /^lab(?:orator)?\.?\s+/i, type: "lab" },
-  { pattern: /^sem(?:inar)?\.?\s+/i, type: "seminar" },
-  { pattern: /^pr(?:act)?\.?\s+/i, type: "practice" },
-  { pattern: /^proiect\.?\s+/i, type: "project" },
+  { pattern: /^lab(?:orator)?(?:\.\s*|\s+)/i, type: "lab" },
+  { pattern: /^sem(?:inar)?(?:\.\s*|\s+)/i, type: "seminar" },
+  { pattern: /^pr(?:act)?(?:\.\s*|\s+)/i, type: "practice" },
+  { pattern: /^proiect(?:\.\s*|\s+)/i, type: "project" },
 ];
 
 interface Segment {
@@ -76,10 +75,25 @@ export function isVenue(text: string): boolean {
   return VENUE_ROOM_RE.test(value) || NAMED_VENUE_RE.test(value);
 }
 
-export function isTeacher(text: string): boolean {
+function isSingleTeacher(text: string): boolean {
   const value = text.trim();
+  if (LANGUAGE_RE.test(value)) return false;
+  if (KNOWN_TEACHER_ALIASES.has(value)) return true;
   if (TEACHER_RE.test(value)) return true;
   return INITIAL_FIRST_TEACHER_RE.test(value) && !SUBJECT_INITIAL_RE.test(value);
+}
+
+export function isTeacher(text: string): boolean {
+  const value = text.trim();
+  if (value.includes(";")) {
+    const parts = value.split(";").map((p) => p.trim()).filter((p) => p.length > 0);
+    return parts.length > 1 && parts.every(isSingleTeacher);
+  }
+  if (value.includes(",")) {
+    const parts = value.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+    return parts.length > 1 && parts.every(isSingleTeacher);
+  }
+  return isSingleTeacher(value);
 }
 
 /** Split the visual lines of a cell into logical lessons. */

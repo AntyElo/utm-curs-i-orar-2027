@@ -229,6 +229,11 @@ describe("test_schedule_normalization", () => {
     expect(classifyType("Educație fizică", null).type).toBe("physical_education");
     expect(classifyType("L. Engleză A1", null).type).toBe("language");
     expect(classifyType("MDPS", null).type).toBe("unknown");
+    expect(classifyType("Lab.PAE", null)).toEqual({ type: "lab", subject: "PAE" });
+    expect(classifyType("Lab. PAE", null)).toEqual({ type: "lab", subject: "PAE" });
+    expect(classifyType("lab.PAE", null)).toEqual({ type: "lab", subject: "PAE" });
+    expect(classifyType("lab. PAE", null)).toEqual({ type: "lab", subject: "PAE" });
+    expect(classifyType("labrador", null)).toEqual({ type: "unknown", subject: "labrador" });
   });
 });
 
@@ -239,9 +244,15 @@ describe("teacher recognition", () => {
     expect(isTeacher("Prozor-Barbalat L.")).toBe(true);
     expect(isTeacher("P. Russu")).toBe(true);
     expect(isTeacher("P.Russu")).toBe(true);
+    expect(isTeacher("L. Stanciu")).toBe(true);
+    expect(isTeacher("Bîrnaz")).toBe(true);
+    expect(isTeacher("BÎrnaz A.")).toBe(true);
+    expect(isTeacher("Bostan V.; Cojuhari E.")).toBe(true);
+    expect(isTeacher("Bostan V. ; Cojuhari E.")).toBe(true);
+    expect(isTeacher("Gavrilița M., Cazacu C., Graur E., Malîi A., Trubca D., Capitan P.")).toBe(true);
   });
 
-  it("keeps abbreviated subjects out of the teacher field", () => {
+  it("keeps abbreviated subjects out of the teacher field while allowing initial-first teachers", () => {
     // "initial + word" is how this timetable abbreviates subjects far more often than it
     // names a teacher, so those initials must not open the initial-first form.
     expect(isTeacher("L. Engleză")).toBe(false);
@@ -252,11 +263,22 @@ describe("teacher recognition", () => {
     expect(isTeacher("c. Fizica")).toBe(false);
     expect(isTeacher("C. Fizica")).toBe(false);
     expect(isTeacher("C. Criptografie")).toBe(false);
+    // Arbitrary semicolon or comma prose is rejected
+    expect(isTeacher("Proiect; Lucrare")).toBe(false);
+    expect(isTeacher("Proiect, Lucrare")).toBe(false);
+    expect(isTeacher("Matematică Discretă, Probabilitate Și Statistică Aplicată")).toBe(false);
   });
 
-  it("canonicalises the space the PDF drops after the initial", () => {
+  it("canonicalises the space the PDF drops after the initial and normalizes teacher variants", () => {
     expect(normalizeTeacher("P.Russu")).toBe("P. Russu");
     expect(normalizeTeacher("P. Russu")).toBe("P. Russu");
+    expect(normalizeTeacher("L. Stanciu")).toBe("L. Stanciu");
+    expect(normalizeTeacher("Bîrnaz")).toBe("Bîrnaz A.");
+    expect(normalizeTeacher("BÎrnaz A.")).toBe("Bîrnaz A.");
+    expect(normalizeTeacher("Bostan V. ; Cojuhari E.")).toBe("Bostan V.; Cojuhari E.");
+    expect(normalizeTeacher("Gavrilița M., Cazacu C., Graur E., Malîi A., Trubca D., Capitan P.")).toBe(
+      "Gavrilița M., Cazacu C., Graur E., Malîi A., Trubca D., Capitan P.",
+    );
     // The surname-first spellings keep the order the PDF prints.
     expect(normalizeTeacher("Costaș A.")).toBe("Costaș A.");
     expect(normalizeTeacher("Ceban Gh.")).toBe("Ceban Gh.");
@@ -369,16 +391,82 @@ describe("subject aliases", () => {
     expect(toCanonicalSubjectTitle(resolveSubjectAlias("Tehnici de pogramare aplicată"))).toBe("Tehnici De Programare Aplicată");
   });
 
-  it("intentionally preserves MDPS as abbreviation for display", () => {
-    // MDPS = "Matematică discretă, Probabilitate și statistică aplicată"
-    // Intentionally kept as abbreviation for display per user preference, not an unresolved alias.
-    expect(resolveSubjectAlias("MDPS")).toBe("MDPS");
-    expect(toCanonicalSubjectTitle(resolveSubjectAlias("MDPS"))).toBe("MDPS");
+  it("expands confirmed MDPS alias to canonical title case", () => {
+    expect(resolveSubjectAlias("MDPS")).toBe("Matematică discretă, probabilitate și statistică aplicată");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("MDPS"))).toBe("Matematică Discretă, Probabilitate Și Statistică Aplicată");
+  });
+
+  it("expands decorated aliases preserving decorations around confirmed alias cores", () => {
+    expect(resolveSubjectAlias("PAE 1/l")).toBe("Proiectarea asistată în electronică 1/l");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("PAE 1/l"))).toBe("Proiectarea Asistată În Electronică 1/l");
+
+    expect(resolveSubjectAlias("PAE 1/e")).toBe("Proiectarea asistată în electronică 1/e");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("PAE 1/e"))).toBe("Proiectarea Asistată În Electronică 1/e");
+
+    expect(resolveSubjectAlias("PADM 1/l")).toBe("Proiectarea asistată de calculator a dispozitivelor medicale 1/l");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("PADM 1/l"))).toBe("Proiectarea Asistată De Calculator A Dispozitivelor Medicale 1/l");
+
+    expect(resolveSubjectAlias("PADM 1/e")).toBe("Proiectarea asistată de calculator a dispozitivelor medicale 1/e");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("PADM 1/e"))).toBe("Proiectarea Asistată De Calculator A Dispozitivelor Medicale 1/e");
+
+    expect(resolveSubjectAlias("1) CDE")).toBe("1) Circuite și dispozitive electronice");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("1) CDE"))).toBe("1) Circuite Și Dispozitive Electronice");
+
+    expect(resolveSubjectAlias("2) MS")).toBe("2) Matematici speciale");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("2) MS"))).toBe("2) Matematici Speciale");
+
+    // Non-alias cores are not expanded
+    expect(resolveSubjectAlias("A-CDE-X")).toBe("A-CDE-X");
+    expect(resolveSubjectAlias("Fizica 1/l")).toBe("Fizica 1/l");
+  });
+
+  it("expands confirmed language abbreviation aliases", () => {
+    expect(resolveSubjectAlias("L. Engleză")).toBe("Limba engleză");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("L. Engleză"))).toBe("Limba Engleză");
+
+    expect(resolveSubjectAlias("L. Română")).toBe("Limba română");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("L. Română"))).toBe("Limba Română");
+
+    expect(resolveSubjectAlias("L. Străină")).toBe("Limba străină");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("L. Străină"))).toBe("Limba Străină");
+
+    expect(resolveSubjectAlias("L. Engleză 1")).toBe("Limba engleză 1");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("L. Engleză 1"))).toBe("Limba Engleză 1");
+
+    expect(resolveSubjectAlias("L. Engleză A1")).toBe("Limba engleză A1");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("L. Engleză A1"))).toBe("Limba Engleză A1");
+
+    expect(resolveSubjectAlias("L.Rom")).toBe("Limba română");
+    expect(resolveSubjectAlias("L. Rom.")).toBe("Limba română");
   });
 
   it("expands confirmed SCS typo to Structuri de calcul și de comunicare", () => {
     expect(resolveSubjectAlias("SCS")).toBe("Structuri de calcul și de comunicare");
     expect(toCanonicalSubjectTitle(resolveSubjectAlias("SCS"))).toBe("Structuri De Calcul Și De Comunicare");
+  });
+
+  it("expands embedded SI subject abbreviation Cadrul Legal al SI without adding global SI alias", () => {
+    expect(resolveSubjectAlias("Cadrul Legal al SI")).toBe("Cadrul Legal al Securității Informaționale");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Cadrul Legal al SI"))).toBe("Cadrul Legal Al Securității Informaționale");
+    expect(resolveSubjectAlias("Cadrul legal al SI")).toBe("Cadrul Legal al Securității Informaționale");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Cadrul legal al SI"))).toBe("Cadrul Legal Al Securității Informaționale");
+
+    // Bare SI is never expanded globally (it is a speciality / group code)
+    expect(resolveSubjectAlias("SI")).toBe("SI");
+  });
+
+  it("resolves Filosofia și Gândire/Gândirea Critică variants and GC abbreviations to Filosofie Și Gândire Critică", () => {
+    expect(resolveSubjectAlias("Filosofia GC")).toBe("Filosofie și gândire critică");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Filosofia GC"))).toBe("Filosofie Și Gândire Critică");
+
+    expect(resolveSubjectAlias("Filosofie GC")).toBe("Filosofie și gândire critică");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Filosofie GC"))).toBe("Filosofie Și Gândire Critică");
+
+    expect(resolveSubjectAlias("Filosofia și Gândire Critică")).toBe("Filosofie și gândire critică");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Filosofia și Gândire Critică"))).toBe("Filosofie Și Gândire Critică");
+
+    expect(resolveSubjectAlias("Filosofia și Gândirea Critică")).toBe("Filosofie și gândire critică");
+    expect(toCanonicalSubjectTitle(resolveSubjectAlias("Filosofia și Gândirea Critică"))).toBe("Filosofie Și Gândire Critică");
   });
 
   it("expands the two abbreviations this timetable misspells", () => {
@@ -593,11 +681,21 @@ describe("regression fixture", () => {
     }
   });
 
-  it("preserves MDPS displayed as MDPS in lessons", () => {
+  it("expands MDPS to canonical title in lessons while raw_text preserves MDPS", () => {
     const mdpsLessons = artifacts.schedule.lessons.filter((l) => l.raw_text.includes("MDPS"));
-    expect(mdpsLessons.length).toBeGreaterThan(0);
+    expect(mdpsLessons).toHaveLength(86);
     for (const lesson of mdpsLessons) {
-      expect(lesson.subject).toBe("MDPS");
+      expect(lesson.subject).toBe("Matematică Discretă, Probabilitate Și Statistică Aplicată");
+      expect(lesson.raw_text).toContain("MDPS");
+    }
+  });
+
+  it("expands L. Engleză to Limba Engleză in lessons while preserving raw_text", () => {
+    const langLessons = artifacts.schedule.lessons.filter((l) => l.raw_text.includes("L. Engleză"));
+    expect(langLessons.length).toBeGreaterThan(0);
+    for (const lesson of langLessons) {
+      expect(lesson.subject).toMatch(/^Limba Engleză/);
+      expect(lesson.raw_text).toContain("L. Engleză");
     }
   });
 });
@@ -680,7 +778,7 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     // Multi-slot subgroup lesson: IBM-251 Marți 08:00–11:15 slot_span=2 1) CDE Chiriac M. A03 subgroup=0.5 gr.
     const cdeSub = schedule.lessons.find((l) => l.day === "Marți" && l.start_time === "08:00" && l.groups.includes("IBM-251"));
     expect(cdeSub).toMatchObject({
-      subject: "1) CDE",
+      subject: "1) Circuite Și Dispozitive Electronice",
       teacher: "Chiriac M.",
       room: "A03",
       slot_span: 2,
@@ -801,21 +899,174 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     const unexpanded = schedule.lessons.filter((lesson) => confirmedBare.has(lesson.subject));
     expect(unexpanded).toHaveLength(0);
 
-    // Residual anomalies survive with their distinct non-bare labels
+    // All confirmed bare abbreviations and their malformed variants are now fully resolved
     const residualAnomalies = schedule.lessons
       .filter((l) => Array.from(confirmedBare).some((abbr) => l.subject.includes(abbr)))
       .map((l) => l.subject);
     const uniqueResidual = Array.from(new Set(residualAnomalies)).sort();
-    expect(uniqueResidual).toEqual([
-      "1) CDE",
-      "2) MS",
-      "CDE Bîrnaz",
-      "Lab.PAE",
-      "MS L. Stanciu",
-      "PADM 1/e",
-      "PADM 1/l",
-      "PAE 1/l",
-      "PAE BÎrnaz A.",
-    ]);
+    expect(uniqueResidual).toEqual([]);
+  });
+
+  it("regression 1: resolves MS | L. Stanciu to Matematici Speciale with teacher L. Stanciu", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const stanciuLessons = schedule.lessons.filter((l) => l.raw_text.includes("L. Stanciu"));
+    expect(stanciuLessons).toHaveLength(3);
+    for (const l of stanciuLessons) {
+      expect(l.subject).toBe("Matematici Speciale");
+      expect(l.teacher).toBe("L. Stanciu");
+      expect(l.raw_text).toContain("MS | L. Stanciu");
+    }
+  });
+
+  it("regression 2: resolves CDE | Bîrnaz to Circuite Și Dispozitive Electronice with teacher Bîrnaz A.", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const birnazLesson = schedule.lessons.find(
+      (l) => l.day === "Marți" && l.start_time === "09:45" && l.groups.includes("AI-251") && l.raw_text.includes("Bîrnaz"),
+    );
+    expect(birnazLesson).toBeDefined();
+    expect(birnazLesson!.subject).toBe("Circuite Și Dispozitive Electronice");
+    expect(birnazLesson!.teacher).toBe("Bîrnaz A.");
+    expect(birnazLesson!.room).toBe("524");
+    expect(birnazLesson!.raw_text).toBe("CDE | Bîrnaz | 524");
+  });
+
+  it("regression 3: resolves Lab.PAE with missing whitespace to Proiectarea Asistată În Electronică with lab type", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const labPaeLesson = schedule.lessons.find((l) => l.raw_text.includes("Lab.PAE"));
+    expect(labPaeLesson).toBeDefined();
+    expect(labPaeLesson!.subject).toBe("Proiectarea Asistată În Electronică");
+    expect(labPaeLesson!.lesson_type).toBe("lab");
+    expect(labPaeLesson!.teacher).toBe("Bîrnaz A.");
+    expect(labPaeLesson!.room).toBe("427");
+    expect(labPaeLesson!.raw_text).toBe("Lab.PAE | Bîrnaz A. | 427");
+  });
+
+  it("regression 4: expands decorated aliases (1) CDE, 2) MS, PAE 1/l, PADM 1/e, PADM 1/l)", () => {
+    const { schedule } = seedArtifactsAnulII;
+
+    // 1) CDE and 2) MS share the same split cell for IBM-251 Marți 08:00
+    const cellLessons = schedule.lessons.filter((l) => l.raw_text.includes("1) CDE | Chiriac M."));
+    expect(cellLessons).toHaveLength(2);
+    expect(cellLessons[0].subject).toBe("1) Circuite Și Dispozitive Electronice");
+    expect(cellLessons[0].teacher).toBe("Chiriac M.");
+    expect(cellLessons[1].subject).toBe("2) Matematici Speciale");
+    expect(cellLessons[1].teacher).toBe("Litra D.");
+
+    // PAE 1/l
+    const pae1l = schedule.lessons.filter((l) => l.raw_text.includes("PAE 1/l"));
+    expect(pae1l.length).toBeGreaterThan(0);
+    for (const l of pae1l) {
+      expect(l.subject).toBe("Proiectarea Asistată În Electronică 1/l");
+    }
+
+    // PADM 1/e
+    const padm1e = schedule.lessons.find((l) => l.raw_text.includes("PADM 1/e"));
+    expect(padm1e).toBeDefined();
+    expect(padm1e!.subject).toBe("Proiectarea Asistată De Calculator A Dispozitivelor Medicale 1/e");
+
+    // PADM 1/l
+    const padm1l = schedule.lessons.find((l) => l.raw_text.includes("PADM 1/l"));
+    expect(padm1l).toBeDefined();
+    expect(padm1l!.subject).toBe("Proiectarea Asistată De Calculator A Dispozitivelor Medicale 1/l");
+  });
+
+  it("regression 5: handles multiple teachers separated by semicolon (Bostan V.; Cojuhari E.)", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const multiTeacher = schedule.lessons.find((l) => l.raw_text.includes("Bostan V. ; Cojuhari E."));
+    expect(multiTeacher).toBeDefined();
+    expect(multiTeacher!.subject).toBe("Matematici Speciale");
+    expect(multiTeacher!.teacher).toBe("Bostan V.; Cojuhari E.");
+    expect(multiTeacher!.room).toBe("3-3 Amdaris");
+    expect(multiTeacher!.raw_text).toBe("c. Matematici Speciale | Bostan V. ; Cojuhari E. | 3-3 Amdaris");
+  });
+
+  it("regression 6: distinguishes languages from initial-first teachers (L. Engleză vs L. Stanciu)", () => {
+    const { schedule } = seedArtifactsAnulII;
+
+    // L. Engleză is a language subject, not teacher
+    const langLessons = schedule.lessons.filter((l) => l.raw_text.startsWith("L. Engleză |"));
+    expect(langLessons.length).toBeGreaterThan(0);
+    for (const l of langLessons) {
+      expect(l.subject).toBe("Limba Engleză");
+      expect(l.lesson_type).toBe("language");
+      expect(l.teacher).toBeNull();
+    }
+
+    // L. Stanciu is a teacher, not a subject
+    const stanciuLessons = schedule.lessons.filter((l) => l.raw_text.includes("L. Stanciu"));
+    expect(stanciuLessons.length).toBeGreaterThan(0);
+    for (const l of stanciuLessons) {
+      expect(l.teacher).toBe("L. Stanciu");
+      expect(l.subject).toBe("Matematici Speciale");
+    }
+  });
+
+  it("regression 7: expands MDPS in real PDF to canonical title case while raw_text preserves MDPS", () => {
+    const { schedule } = artifacts;
+    const mdpsLessons = schedule.lessons.filter((l) => l.raw_text.includes("MDPS"));
+    expect(mdpsLessons.length).toBe(86);
+    for (const l of mdpsLessons) {
+      expect(l.subject).toBe("Matematică Discretă, Probabilitate Și Statistică Aplicată");
+      expect(l.raw_text).toMatch(/\bMDPS\b/);
+    }
+  });
+
+  it("regression 8: normalizes BÎrnaz A. typo variant to Bîrnaz A. (lab. PAE | BÎrnaz A. | 404)", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const lesson = schedule.lessons.find((l) => l.raw_text.includes("BÎrnaz A."));
+    expect(lesson).toBeDefined();
+    expect(lesson!.subject).toBe("Proiectarea Asistată În Electronică");
+    expect(lesson!.teacher).toBe("Bîrnaz A.");
+    expect(lesson!.room).toBe("404");
+    expect(lesson!.raw_text).toBe("lab. PAE | BÎrnaz A. | 404");
+  });
+
+  it("regression 9: recognizes comma-separated multi-teacher list in Anul I PCAS lesson", () => {
+    const { schedule } = seedArtifacts;
+    const pcasLesson = schedule.lessons.find((l) => l.raw_text.includes("Gavrilița M."));
+    expect(pcasLesson).toBeDefined();
+    expect(pcasLesson!.subject).toBe("Proiectarea Conceptuală A Unei Aplicații Software");
+    expect(pcasLesson!.teacher).toBe("Gavrilița M., Cazacu C., Graur E., Malîi A., Trubca D., Capitan P.");
+    expect(pcasLesson!.room).toBe("3-3");
+    expect(pcasLesson!.raw_text).toBe("Proiect PCAS | Gavrilița M., Cazacu C., Graur E., Malîi A., Trubca D., Capitan P. | 3-3");
+  });
+
+  it("regression 10: expands embedded SI in Cadrul Legal al SI to canonical title while raw_text preserves original", () => {
+    const { schedule } = seedArtifactsAnulII;
+    const siLessons = schedule.lessons.filter((l) => l.raw_text.includes("Cadrul Legal al SI"));
+    expect(siLessons).toHaveLength(2);
+    for (const l of siLessons) {
+      expect(l.subject).toBe("Cadrul Legal Al Securității Informaționale");
+      expect(l.teacher).toBe("Bulai I.");
+      expect(l.raw_text).toContain("c. Cadrul Legal al SI");
+    }
+  });
+
+  it("regression 11: resolves all Filosofia/Filosofie și Gândire/Gândirea Critică variants to Filosofie Și Gândire Critică", () => {
+    const { schedule } = seedArtifactsAnulII;
+
+    // c. Filosofia și Gândire Critică (AI-251, AI-252)
+    const var1 = schedule.lessons.find((l) => l.raw_text.includes("c. Filosofia și Gândire Critică"));
+    expect(var1).toBeDefined();
+    expect(var1!.subject).toBe("Filosofie Și Gândire Critică");
+    expect(var1!.raw_text).toContain("c. Filosofia și Gândire Critică");
+
+    // c. Filosofia și Gândirea Critică (CR-251, CR-252, CR-253)
+    const var2 = schedule.lessons.find((l) => l.raw_text.includes("c. Filosofia și Gândirea Critică"));
+    expect(var2).toBeDefined();
+    expect(var2!.subject).toBe("Filosofie Și Gândire Critică");
+    expect(var2!.raw_text).toContain("c. Filosofia și Gândirea Critică");
+
+    // Filosofia GC (e.g. TI-251..TI-255 seminar/discussion)
+    const gcLessons = schedule.lessons.filter((l) => l.raw_text.includes("Filosofia GC"));
+    expect(gcLessons.length).toBeGreaterThan(0);
+    for (const l of gcLessons) {
+      expect(l.subject).toBe("Filosofie Și Gândire Critică");
+      expect(l.raw_text).toContain("Filosofia GC");
+    }
+
+    // All 9 critical thinking philosophy lessons now converge to the single canonical title
+    const allCritica = schedule.lessons.filter((l) => l.subject === "Filosofie Și Gândire Critică");
+    expect(allCritica).toHaveLength(9);
   });
 });
