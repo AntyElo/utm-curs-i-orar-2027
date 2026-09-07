@@ -69,14 +69,14 @@ export class UnsupportedCourseError extends Error {
  */
 const BUNDLED_SEEDS: Record<number, { fileName: string; originalUrl: string; sha256: string }> = {
   1: {
-    fileName: "anul_i_semestrul_i-9.pdf",
-    originalUrl: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
-    sha256: "52e7f14be27a996e17d0614c1f9fe769d63bdf76876fce6d4fc60f026bf8c015",
+    fileName: "anul_i_semestrul_i-18.pdf",
+    originalUrl: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
+    sha256: "a4c610d24dd53bbf87c5da312ffebf7aabc112c7f28338587e18e1eb0526b79a",
   },
   2: {
-    fileName: "anul_ii_semestrul_iii-8.pdf",
-    originalUrl: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-8.pdf",
-    sha256: "35b0ce85609198e344d6f78ffdc8df80d75b36430817e0bc1393c7a0eb019187",
+    fileName: "anul_ii_semestrul_iii-11.pdf",
+    originalUrl: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-11.pdf",
+    sha256: "3728f5ab165b6fe5095609d9aeff54da687c8312ed0ec1e89a9a951807a0a23b",
   },
 };
 

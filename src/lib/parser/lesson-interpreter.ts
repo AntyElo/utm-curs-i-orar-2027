@@ -26,7 +26,7 @@ const VENUE_ROOM_RE = new RegExp(`^(?:(?:aula|sala|sală)\\s+)?${ROOM_ATOM}(?:\\
 /** A venue named instead of numbered: "Sala sportivă", "Terenul sportiv". */
 const NAMED_VENUE_RE = /^(?:sal[aă]|aul[aă]|teren(?:ul)?|stadion(?:ul)?)\s+[A-Za-zĂÂÎȘȚăâîșț][A-Za-zĂÂÎȘȚăâîșț\s.-]*$/i;
 const NAME_WORD = "[A-ZĂÂÎȘȚ][a-zăâîșț]+(?:-[A-Za-zĂÂÎȘȚăâîșț][a-zăâîșț]+)?";
-const TEACHER_RE = new RegExp(`^${NAME_WORD}(?: ${NAME_WORD})?\\s+(?:[A-ZĂÂÎȘȚ][a-zăâîșț]{0,2}\\.?|[a-z]\\.)$`);
+const TEACHER_RE = new RegExp(`^${NAME_WORD}(?: ${NAME_WORD})?(?:\\s+(?:[A-ZĂÂÎȘȚ][a-zăâîșț]{0,2}\\.?|[a-z]\\.)|[A-ZĂÂÎȘȚ]\\.)$`);
 /** A few cells put the initial first instead: "P. Russu", "P.Russu", "L. Stanciu". */
 const INITIAL_FIRST_TEACHER_RE = new RegExp(`^[A-ZĂÂÎȘȚ]\\.\\s?${NAME_WORD}$`);
 /**

@@ -13,10 +13,16 @@ import { parsePdf, sha256, type ParseArtifacts } from "@/lib/parser";
 import type { Grid } from "@/lib/parser/geometry";
 
 const FIXTURE = path.join(__dirname, "fixtures", "anul_i_semestrul_ii-1.pdf");
-const SEED = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-9.pdf");
-const SEED_ANUL_II = path.join(__dirname, "..", "data", "seed", "anul_ii_semestrul_iii-8.pdf");
+const SEED = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-18.pdf");
+const SEED_ANUL_II = path.join(__dirname, "..", "data", "seed", "anul_ii_semestrul_iii-11.pdf");
 const REGRESSION = path.join(__dirname, "fixtures", "expected-spring-2026.json");
-const SEED_HASH = "52e7f14be27a996e17d0614c1f9fe769d63bdf76876fce6d4fc60f026bf8c015";
+/** The seeds these two replaced; kept so the parser is proven unchanged against them. */
+const PREVIOUS_SEED_ANUL_I = path.join(__dirname, "fixtures", "anul_i_semestrul_i-9.pdf");
+const PREVIOUS_SEED_ANUL_II = path.join(__dirname, "fixtures", "anul_ii_semestrul_iii-8.pdf");
+const FIXTURE_ANUL_I_16 = path.join(__dirname, "fixtures", "anul_i_semestrul_i-16.pdf");
+const FIXTURE_ANUL_II_10 = path.join(__dirname, "fixtures", "anul_ii_semestrul_iii-10.pdf");
+const SEED_HASH = "a4c610d24dd53bbf87c5da312ffebf7aabc112c7f28338587e18e1eb0526b79a";
+const SEED_HASH_ANUL_II = "3728f5ab165b6fe5095609d9aeff54da687c8312ed0ec1e89a9a951807a0a23b";
 
 const provenance = {
   source_page_url: "https://fcim.utm.md/procesul-de-studii/orar/",
@@ -33,31 +39,41 @@ let seedBytes: Uint8Array;
 let seedArtifacts: ParseArtifacts;
 let seedBytesAnulII: Uint8Array;
 let seedArtifactsAnulII: ParseArtifacts;
+let fixture16Bytes: Uint8Array;
+let fixture16Artifacts: ParseArtifacts;
 
 beforeAll(async () => {
-  const [fixtureBytes, bundledBytes, bundledAnulIIBytes] = await Promise.all([
+  const [fixtureBytes, bundledBytes, bundledAnulIIBytes, f16Bytes] = await Promise.all([
     readFile(FIXTURE),
     readFile(SEED),
     readFile(SEED_ANUL_II),
+    readFile(FIXTURE_ANUL_I_16),
   ]);
   pdfBytes = new Uint8Array(fixtureBytes);
   seedBytes = new Uint8Array(bundledBytes);
   seedBytesAnulII = new Uint8Array(bundledAnulIIBytes);
+  fixture16Bytes = new Uint8Array(f16Bytes);
   [page] = await extractPages(pdfBytes);
   grid = buildGrid(page.rects);
-  [artifacts, seedArtifacts, seedArtifactsAnulII] = await Promise.all([
+  [artifacts, seedArtifacts, seedArtifactsAnulII, fixture16Artifacts] = await Promise.all([
     parsePdf(pdfBytes, provenance),
     parsePdf(seedBytes, {
       ...provenance,
-      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
+      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
       source_kind: "seed",
       course_year: 1,
     }),
     parsePdf(seedBytesAnulII, {
       ...provenance,
-      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-8.pdf",
+      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-11.pdf",
       source_kind: "seed",
       course_year: 2,
+    }),
+    parsePdf(fixture16Bytes, {
+      ...provenance,
+      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-16.pdf",
+      source_kind: "seed",
+      course_year: 1,
     }),
   ]);
 });
@@ -616,8 +632,8 @@ describe("test_merged_lectures_reach_every_group", () => {
     const split = byRaw("Criptografie | Reșetnicov M. | D02/04");
     expect(split).toMatchObject({ subject: "Criptografie", teacher: "Reșetnicov M.", room: "D02/04", uncertain: false });
 
-    const patron = byRaw("c. Tehnici de Programare | Roșca V. | 3-3 Amdaris");
-    expect(patron).toMatchObject({ subject: "Tehnici De Programare", room: "3-3 Amdaris", lesson_type: "lecture" });
+    const patron = byRaw("c. Analiza Matematică | Costaș A. | 3-3 Amdaris");
+    expect(patron).toMatchObject({ subject: "Analiza Matematică", room: "3-3 Amdaris", lesson_type: "lecture" });
 
     const sports = byRaw("Educație fizică | Sala sportivă");
     expect(sports).toMatchObject({ lesson_type: "physical_education", room: "Sala sportivă", uncertain: false });
@@ -625,15 +641,16 @@ describe("test_merged_lectures_reach_every_group", () => {
 });
 
 describe("autumn 2026 packaged-seed regression", () => {
-  it("parses and validates the verified -9.pdf fixture", () => {
+  it("parses and validates the verified -18.pdf seed", () => {
     const { schedule } = seedArtifacts;
     expect(sha256(seedBytes)).toBe(SEED_HASH);
     expect(schedule.metadata.source_pdf_hash).toBe(SEED_HASH);
-    expect(schedule.metadata.source_pdf_url).toMatch(/anul_i_semestrul_i-9\.pdf$/);
+    expect(schedule.metadata.source_pdf_url).toMatch(/anul_i_semestrul_i-18\.pdf$/);
     expect(schedule.groups).toHaveLength(41);
-    expect(schedule.lessons).toHaveLength(449);
+    expect(schedule.lessons).toHaveLength(452);
     expect(schedule.lessons.filter((lesson) => lesson.uncertain)).toHaveLength(0);
     expect(validateSchedule(schedule).ok).toBe(true);
+    expect(validateSchedule(schedule).warnings).toEqual([]);
   });
 
   it("reads the teacher this PDF writes initial-first", () => {
@@ -694,6 +711,223 @@ describe("autumn 2026 packaged-seed regression", () => {
       expect(lesson.subject).toBe("Tehnici De Programare Aplicată");
       expect(lesson.raw_text).toContain("pogramare");
     }
+  });
+});
+
+describe("autumn 2026 Anul II packaged-seed regression", () => {
+  it("parses and validates the verified -11.pdf seed", () => {
+    const { schedule } = seedArtifactsAnulII;
+    expect(sha256(seedBytesAnulII)).toBe(SEED_HASH_ANUL_II);
+    expect(schedule.metadata.source_pdf_hash).toBe(SEED_HASH_ANUL_II);
+    expect(schedule.metadata.source_pdf_url).toMatch(/anul_ii_semestrul_iii-11\.pdf$/);
+    expect(schedule.groups).toHaveLength(26);
+    expect(schedule.lessons).toHaveLength(288);
+    expect(schedule.lessons.filter((lesson) => lesson.uncertain)).toHaveLength(0);
+    expect(seedArtifactsAnulII.border_repairs).toHaveLength(0);
+    expect(validateSchedule(schedule).ok).toBe(true);
+    expect(validateSchedule(schedule).warnings).toEqual([]);
+  });
+});
+
+/**
+ * anul_i_semestrul_i-16.pdf clips the top of the TI-263 | IA-261 column border inside the
+ * Vineri 11:30 row: it is drawn above the row and again from 632.45 down, but the ~5.9 pt
+ * stub at the row's top edge is missing. The first printed line of both cells therefore found
+ * no border between the columns and was reconstructed as one box spanning both, which
+ * `dropEngulfingCells` demoted to an orphan – losing the subject of two real lessons.
+ */
+describe("clipped column border in the Anul I -16 fixture", () => {
+  it("restores exactly one border, in the row that is actually damaged", () => {
+    const repairs = fixture16Artifacts.border_repairs;
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0].day).toBe("Vineri");
+    expect(repairs[0].start_time).toBe("11:30");
+    // The TI-263 | IA-261 column boundary, not an arbitrary vertical gap.
+    expect(repairs[0].x).toBeCloseTo(433.6, 1);
+    expect(repairs[0].gap).toBeLessThan(6);
+    expect(repairs[0].kind).toBe("top_stub");
+    expect(fixture16Artifacts.orphans).toHaveLength(0);
+    expect(fixture16Artifacts.schedule.warnings).toEqual([]);
+  });
+
+  it("reads TI-263 Vineri 11:30 as a lesson instead of a bare venue", () => {
+    const lesson = fixture16Artifacts.schedule.lessons.find(
+      (l) => l.day === "Vineri" && l.start_time === "11:30" && l.groups.includes("TI-263") && l.raw_text.includes("Ed. Fizică"),
+    );
+    expect(lesson).toBeDefined();
+    expect(lesson).toMatchObject({
+      subject: "Educație Fizică",
+      teacher: null,
+      room: "Sala sportivă",
+      lesson_type: "physical_education",
+      week_parity: "odd",
+      uncertain: false,
+    });
+    expect(lesson!.groups).toEqual(["TI-263"]);
+    expect(lesson!.raw_text).toBe("Ed. Fizică | Sala sportivă");
+  });
+
+  it("reads IA-261 Vineri 11:30 as a lesson instead of a teacher and a room", () => {
+    const lesson = fixture16Artifacts.schedule.lessons.find(
+      (l) => l.day === "Vineri" && l.start_time === "11:30" && l.groups.includes("IA-261") && l.raw_text.includes("TPA"),
+    );
+    expect(lesson).toBeDefined();
+    expect(lesson).toMatchObject({
+      subject: "Tehnici De Programare Aplicată",
+      teacher: "Rotari A.",
+      room: "D01-03",
+      week_parity: "both",
+      uncertain: false,
+    });
+    expect(lesson!.groups).toEqual(["IA-261"]);
+    expect(lesson!.raw_text).toBe("TPA | Rotari A. | D01-03");
+  });
+
+  it("leaves no lesson whose subject is really a venue, a teacher or a room", () => {
+    for (const lesson of fixture16Artifacts.schedule.lessons) {
+      expect(isVenue(lesson.subject), lesson.raw_text).toBe(false);
+      expect(isRoom(lesson.subject), lesson.raw_text).toBe(false);
+      expect(lesson.subject, lesson.raw_text).not.toContain("Rotari A.");
+    }
+  });
+});
+
+describe("internal gap column border in the canonical Anul I -18 seed", () => {
+  it("restores exactly one internal-gap border in row Miercuri 09:45", () => {
+    const repairs = seedArtifacts.border_repairs;
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0].day).toBe("Miercuri");
+    expect(repairs[0].start_time).toBe("09:45");
+    // The IBM-261 | AI-262 column boundary at x ≈ 841.9
+    expect(repairs[0].x).toBeCloseTo(841.9, 1);
+    expect(repairs[0].gap).toBeCloseTo(2.75, 2);
+    expect(repairs[0].kind).toBe("internal_gap");
+    expect(seedArtifacts.orphans).toHaveLength(0);
+    expect(seedArtifacts.schedule.warnings).toEqual([]);
+  });
+
+  it("recovers IBM-261 Miercuri 09:45 with both teachers Bernat O. and Pilețchi N.", () => {
+    const ibmLesson = seedArtifacts.schedule.lessons.find(
+      (l) => l.day === "Miercuri" && l.start_time === "09:45" && l.groups.includes("IBM-261"),
+    );
+    expect(ibmLesson).toBeDefined();
+    expect(ibmLesson!.subject).toBe("Fizică");
+    expect(ibmLesson!.teacher).toContain("Bernat O.");
+    expect(ibmLesson!.teacher).toContain("Pilețchi N.");
+    expect(ibmLesson!.teacher).toBe("Bernat O., Pilețchi N.");
+    expect(ibmLesson!.room).toBe("301/304");
+    expect(ibmLesson!.lesson_type).toBe("lab");
+    expect(ibmLesson!.week_parity).toBe("even");
+    expect(ibmLesson!.raw_text).toBe("Lab. Fizica | Bernat O., Pilețchi N. | 301/304");
+    expect(ibmLesson!.uncertain).toBe(false);
+  });
+
+  it("does not assign Bernat/Pilețchi to neighbouring group AI-262", () => {
+    const aiLessons = seedArtifacts.schedule.lessons.filter(
+      (l) => l.day === "Miercuri" && l.start_time === "09:45" && l.groups.includes("AI-262"),
+    );
+    expect(aiLessons).toHaveLength(0);
+
+    const wedBernat = seedArtifacts.schedule.lessons.filter(
+      (l) =>
+        l.day === "Miercuri" &&
+        l.start_time === "09:45" &&
+        ((l.teacher ?? "").includes("Bernat O.") || (l.teacher ?? "").includes("Pilețchi N.")),
+    );
+    expect(wedBernat).toHaveLength(1);
+    expect(wedBernat[0].groups).toEqual(["IBM-261"]);
+  });
+
+  it("resolves IA-261 Vineri 13:30 Limba Engleză with teacher DutoaL., Nicolai F. without collision", () => {
+    const iaLessons = seedArtifacts.schedule.lessons.filter(
+      (l) => l.day === "Vineri" && l.start_time === "13:30" && l.groups.includes("IA-261"),
+    );
+    expect(iaLessons).toHaveLength(1);
+    const lesson = iaLessons[0];
+    expect(lesson.subject).toBe("Limba Engleză");
+    expect(lesson.teacher).toBe("DutoaL., Nicolai F.");
+    expect(lesson.room).toBe("203/601");
+    expect(lesson.lesson_type).toBe("language");
+    expect(lesson.raw_text).toBe("L. Engleză | 203/601 | DutoaL., Nicolai F.");
+    expect(lesson.uncertain).toBe(false);
+  });
+
+  it("does not touch the geometry of PDFs that are not damaged", async () => {
+    // The repair must be inert everywhere else: the previously shipped seeds parse exactly
+    // as they did before it existed, and the current Anul II seed needs no repair at all.
+    const cases = [
+      { file: PREVIOUS_SEED_ANUL_I, groups: 41, lessons: 449 },
+      { file: PREVIOUS_SEED_ANUL_II, groups: 26, lessons: 288 },
+      { file: FIXTURE_ANUL_II_10, groups: 26, lessons: 288 },
+    ];
+    for (const sample of cases) {
+      const artifacts = await parsePdf(new Uint8Array(await readFile(sample.file)), { ...provenance, source_kind: "seed" });
+      expect(artifacts.border_repairs, sample.file).toHaveLength(0);
+      expect(artifacts.orphans, sample.file).toHaveLength(0);
+      expect(artifacts.schedule.groups, sample.file).toHaveLength(sample.groups);
+      expect(artifacts.schedule.lessons, sample.file).toHaveLength(sample.lessons);
+      expect(artifacts.schedule.lessons.filter((lesson) => lesson.uncertain), sample.file).toHaveLength(0);
+    }
+    expect(seedArtifactsAnulII.border_repairs).toHaveLength(0);
+  });
+});
+
+describe("subjects the Anul I seed prints unusually", () => {
+  it("corrects the misplaced space in \"Tehnici d eprogramare\" without rewriting the printed text", () => {
+    const lesson = seedLesson("Joi", "18:45", "AI-261", "C. Tehnici d eprogramare | Roșca N. | 6-2");
+    expect(lesson).toMatchObject({
+      subject: "Tehnici De Programare",
+      teacher: "Roșca N.",
+      room: "6-2",
+      lesson_type: "lecture",
+      uncertain: false,
+    });
+    expect(lesson.raw_text).toBe("C. Tehnici d eprogramare | Roșca N. | 6-2");
+    // The correction is one exact string, not a general space repair.
+    expect(resolveSubjectAlias("Tehnici d eprogramare")).toBe("Tehnici de programare");
+    expect(resolveSubjectAlias("Tehnici d eprogramare aplicată")).toBe("Tehnici d eprogramare aplicată");
+  });
+
+  it("folds the articulated \"Educația fizică\" into the one canonical discipline", () => {
+    // One confirmed spelling of the same official discipline (the UTM curriculum names it
+    // "Educație fizică"), resolved as an exact string — not grammatical normalisation.
+    expect(resolveSubjectAlias("Educația fizică")).toBe("Educație fizică");
+
+    const { schedule } = seedArtifacts;
+    // The timetable no longer splits one discipline across two canonical subjects.
+    expect(schedule.lessons.filter((l) => l.subject === "Educația Fizică")).toHaveLength(0);
+    expect([...new Set(schedule.lessons.map((l) => l.subject).filter((s) => /Fizic/i.test(s)))].sort()).toEqual([
+      "Educație Fizică",
+      "Fizică",
+    ]);
+
+    // The lesson that printed it joins the canonical subject; its own text is untouched.
+    const lesson = seedLesson("Joi", "13:30", "EA-261", "Educația fizică | Sala sportivă");
+    expect(lesson).toMatchObject({
+      subject: "Educație Fizică",
+      room: "Sala sportivă",
+      lesson_type: "physical_education",
+      uncertain: false,
+    });
+    expect(lesson.raw_text).toBe("Educația fizică | Sala sportivă");
+
+    // The variants that already resolved are unchanged, and nothing else moved.
+    expect(resolveSubjectAlias("Ed. Fizică")).toBe("Educație fizică");
+    expect(resolveSubjectAlias("Ed. fizică")).toBe("Educație fizică");
+    expect(resolveSubjectAlias("Educație fizică")).toBe("Educație fizică");
+    expect(schedule.lessons.filter((l) => l.raw_text.toLowerCase().includes("ed. fizică"))).toHaveLength(29);
+    expect(schedule.lessons.filter((l) => l.subject === "Educație Fizică")).toHaveLength(36);
+  });
+
+  it("leaves the unconfirmed abbreviation TC exactly as printed", () => {
+    // FCIM publishes no expansion for "TC" in this timetable, and PC / TP / Teoria
+    // circuitelor are all plausible. An abbreviation nobody confirmed stays an abbreviation.
+    const lesson = seedLesson("Marți", "11:30", "AI-262", "TC | Cazac A. | 112");
+    expect(lesson.subject).toBe("TC");
+    expect(lesson.teacher).toBe("Cazac A.");
+    expect(lesson.room).toBe("112");
+    expect(resolveSubjectAlias("TC")).toBe("TC");
+    expect(resolveSubjectAlias("TC", ["AI-262"])).toBe("TC");
   });
 });
 
@@ -1037,7 +1271,7 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     for (const l of langLessons) {
       expect(l.subject).toBe("Limba Engleză");
       expect(l.lesson_type).toBe("language");
-      expect(l.teacher).toBeNull();
+      expect(l.teacher).not.toBe("L. Engleză");
     }
 
     // L. Stanciu is a teacher, not a subject
@@ -1075,8 +1309,8 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     expect(pcasLesson).toBeDefined();
     expect(pcasLesson!.subject).toBe("Proiectarea Conceptuală A Unei Aplicații Software");
     expect(pcasLesson!.teacher).toBe("Gavrilița M., Cazacu C., Graur E., Malîi A., Trubca D., Capitan P.");
-    expect(pcasLesson!.room).toBe("3-3");
-    expect(pcasLesson!.raw_text).toBe("Proiect PCAS | Gavrilița M., Cazacu C., Graur E., Malîi A., Trubca D., Capitan P. | 3-3");
+    expect(pcasLesson!.room).toBe("6-2");
+    expect(pcasLesson!.raw_text).toBe("Proiect PCAS | Gavrilița M., Cazacu C., Graur E., Malîi A., Trubca D., Capitan P. | 6-2");
   });
 
   it("regression 10: expands embedded SI in Cadrul Legal al SI to canonical title while raw_text preserves original", () => {
@@ -1157,17 +1391,17 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
   it("regression 15: resolves Ed. Fizică and Fizica to Educație Fizică and Fizică in Anul I", () => {
     const { schedule } = seedArtifacts;
 
-    // Ed. Fizică -> Educație Fizică (33 total: 27 + 6)
+    // Ed. Fizică -> Educație Fizică (36 total: 29 printed "Ed. fizică", 6 spelled out, 1 articulated)
     const edFiz = schedule.lessons.filter((l) => l.raw_text.toLowerCase().includes("ed. fizică"));
-    expect(edFiz).toHaveLength(27);
+    expect(edFiz).toHaveLength(29);
     for (const l of edFiz) {
       expect(l.subject).toBe("Educație Fizică");
       expect(l.raw_text.toLowerCase()).toContain("ed. fizică");
     }
     const allPe = schedule.lessons.filter((l) => l.subject === "Educație Fizică");
-    expect(allPe).toHaveLength(33);
+    expect(allPe).toHaveLength(36);
 
-    // Fizica -> Fizică (26 total: 16 + 10)
+    // Fizica -> Fizică (27 total in -18: 16 + 11, including recovered IBM-261 lab)
     const fizica = schedule.lessons.filter((l) => l.raw_text.includes("Fizica"));
     expect(fizica).toHaveLength(16);
     for (const l of fizica) {
@@ -1175,19 +1409,19 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
       expect(l.raw_text).toContain("Fizica");
     }
     const allFiz = schedule.lessons.filter((l) => l.subject === "Fizică");
-    expect(allFiz).toHaveLength(26);
+    expect(allFiz).toHaveLength(27);
   });
 
   it("regression 16: resolves Algebră Liniară and Etica și Integritatea Academică in Anul I", () => {
     const { schedule } = seedArtifacts;
 
-    // c. Algebră Liniară și Geometrie Analitică (1 lesson) -> Algebra Liniară Și Geometria Analitică (44 total)
+    // c. Algebră Liniară și Geometrie Analitică (1 lesson) -> Algebra Liniară Și Geometria Analitică (43 total)
     const algaVar = schedule.lessons.find((l) => l.raw_text.includes("Algebră Liniară și Geometrie Analitică"));
     expect(algaVar).toBeDefined();
     expect(algaVar!.subject).toBe("Algebra Liniară Și Geometria Analitică");
     expect(algaVar!.raw_text).toContain("c. Algebră Liniară și Geometrie Analitică");
     const allAlga = schedule.lessons.filter((l) => l.subject === "Algebra Liniară Și Geometria Analitică");
-    expect(allAlga).toHaveLength(44);
+    expect(allAlga).toHaveLength(43);
 
     // c. Etica și integritatea academică (1 lesson) -> Etică Și Integritate Academică (9 total)
     const eiaVar = schedule.lessons.find((l) => l.raw_text.includes("Etica și integritatea academică"));
@@ -1246,7 +1480,7 @@ describe("autumn 2026 packaged-seed course 2 regression", () => {
     // Proves raw_text is preserved exactly as printed
     const sample1 = eng1Lessons.find((l) => l.raw_text.includes("L.Engleza 1"));
     expect(sample1).toBeDefined();
-    expect(sample1!.raw_text).toBe("L.Engleza 1 | 720/624");
+    expect(sample1!.raw_text).toBe("L.Engleza 1 | 720/624 | Tintiuc C., Șișianu A.");
     expect(sample1!.subject).toBe("Limba Engleză");
 
     // Total Limba Engleză lessons in Anul I now equals 35 (29 + 6)

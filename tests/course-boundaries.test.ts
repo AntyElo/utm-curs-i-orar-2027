@@ -34,7 +34,7 @@ async function mkdtempDir(): Promise<string> {
   return mkdtemp(path.join(tmpdir(), "fcim-bounds-"));
 }
 
-const PDF_A = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf";
+const PDF_A = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf";
 const PDF_B = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-5.pdf";
 
 /** A minimal but schema-valid schedule; storage cares about identity, not lesson content. */

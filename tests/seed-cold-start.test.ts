@@ -30,16 +30,23 @@ process.env.SCHEDULE_SEED_PDF_2 = packagedSeedTwo;
 const { courseSeed } = await import("@/lib/courses");
 const { sha256 } = await import("@/lib/parser");
 const { checkForUpdates } = await import("@/lib/services/updater");
-const { getCurrentSchedule, getSourceState, resetStorageCache } = await import("@/lib/storage");
+const { getCurrentSchedule, getSourceState, replaceCurrentSchedule, resetStorageCache, saveSourceState } =
+  await import("@/lib/storage");
+const { parsePdf } = await import("@/lib/parser");
 
-const ANUL_I_SEED = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-9.pdf");
-const ANUL_II_SEED = path.join(__dirname, "..", "data", "seed", "anul_ii_semestrul_iii-8.pdf");
+const ANUL_I_SEED = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-18.pdf");
+const ANUL_II_SEED = path.join(__dirname, "..", "data", "seed", "anul_ii_semestrul_iii-11.pdf");
+/** The revisions these two replaced - what a long-lived volume still holds. */
+const PREVIOUS_ANUL_I_SEED = path.join(__dirname, "fixtures", "anul_i_semestrul_i-16.pdf");
+const PREVIOUS_ANUL_II_SEED = path.join(__dirname, "fixtures", "anul_ii_semestrul_iii-10.pdf");
 const PAGE_URL = "https://fcim.utm.md/procesul-de-studii/orar/";
 const WORDPRESS_URL = "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view";
-const ANUL_I_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf";
-const ANUL_II_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-8.pdf";
-const ANUL_I_HASH = "52e7f14be27a996e17d0614c1f9fe769d63bdf76876fce6d4fc60f026bf8c015";
-const ANUL_II_HASH = "35b0ce85609198e344d6f78ffdc8df80d75b36430817e0bc1393c7a0eb019187";
+const ANUL_I_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf";
+const ANUL_II_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-11.pdf";
+const ANUL_I_HASH = "a4c610d24dd53bbf87c5da312ffebf7aabc112c7f28338587e18e1eb0526b79a";
+const ANUL_II_HASH = "3728f5ab165b6fe5095609d9aeff54da687c8312ed0ec1e89a9a951807a0a23b";
+const PREVIOUS_ANUL_I_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-16.pdf";
+const PREVIOUS_ANUL_II_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-10.pdf";
 
 let anulIBytes: Uint8Array;
 let anulIIBytes: Uint8Array;
@@ -109,8 +116,8 @@ describe("each course has its own verified seed", () => {
     expect(two!.pdfPath).not.toBe(one!.pdfPath);
     expect(two!.imagePdfPath).not.toBe(one!.imagePdfPath);
     expect(two!.mirrorUrl).not.toBe(one!.mirrorUrl);
-    expect(two!.imagePdfPath).toMatch(/[\\/]seed[\\/]anul_ii_semestrul_iii-8\.pdf$/);
-    expect(one!.imagePdfPath).toMatch(/[\\/]seed[\\/]anul_i_semestrul_i-9\.pdf$/);
+    expect(two!.imagePdfPath).toMatch(/[\\/]seed[\\/]anul_ii_semestrul_iii-11\.pdf$/);
+    expect(one!.imagePdfPath).toMatch(/[\\/]seed[\\/]anul_i_semestrul_i-18\.pdf$/);
   });
 
   it("ships bytes matching the hash each seed claims", () => {
@@ -246,7 +253,7 @@ describe("both courses bootstrap offline in the same process", () => {
     const one = await checkForUpdates(1);
     const two = await checkForUpdates(2);
 
-    expect(one).toMatchObject({ course_year: 1, outcome: "seeded", groups: 41, lessons: 449 });
+    expect(one).toMatchObject({ course_year: 1, outcome: "seeded", groups: 41, lessons: 452 });
     expect(two).toMatchObject({ course_year: 2, outcome: "seeded", groups: 26, lessons: 288 });
 
     const [scheduleOne, scheduleTwo] = await Promise.all([getCurrentSchedule(1), getCurrentSchedule(2)]);
@@ -270,7 +277,7 @@ describe("both courses bootstrap offline in the same process", () => {
     // Course 2 has neither a packaged file nor a routed mirror here.
     expect((await checkForUpdates(2)).outcome).toBe("error");
 
-    expect((await getCurrentSchedule(1))?.lessons).toHaveLength(449);
+    expect((await getCurrentSchedule(1))?.lessons).toHaveLength(452);
     expect(await getCurrentSchedule(2)).toBeNull();
     // Course 1 ends on its seed; the discovery failure stays recorded as a truthful
     // diagnostic rather than being erased, and course 2's own failure is separate.
@@ -278,5 +285,90 @@ describe("both courses bootstrap offline in the same process", () => {
     expect((await getSourceState(1)).current_pdf_url).toBe(ANUL_I_URL);
     expect((await getSourceState(2)).last_result).toBe("error");
     expect((await getSourceState(2)).last_error).toMatch(/no bundled seed|not found|404/i);
+  });
+});
+
+/**
+ * The deployment situation this update creates: a long-lived Render volume still holds the
+ * seed of the previous revision, the container ships a newer one, and FCIM is still behind
+ * a Cloudflare challenge. Discovery keeps failing — the packaged baseline must move forward
+ * anyway, for both courses, without either one borrowing the other's document.
+ */
+describe("a persisted older seed is promoted to the packaged one", () => {
+  async function persistPreviousSeed(courseYear: number, file: string, url: string) {
+    const { schedule } = await parsePdf(new Uint8Array(await readFile(file)), {
+      source_page_url: PAGE_URL,
+      source_pdf_url: url,
+      source_kind: "seed",
+      downloaded_at: "2026-09-01T00:00:00.000Z",
+      course_year: courseYear,
+    });
+    await replaceCurrentSchedule(courseYear, schedule);
+    await saveSourceState(courseYear, {
+      current_pdf_url: url,
+      current_pdf_hash: schedule.metadata.source_pdf_hash,
+      last_check_at: "2026-09-01T00:00:00.000Z",
+      last_success_at: "2026-09-01T00:00:00.000Z",
+      last_result: "seeded",
+      academic_year: schedule.metadata.academic_year,
+      semester: schedule.metadata.semester,
+    });
+    return schedule;
+  }
+
+  it("moves Anul I -16 to -18 and Anul II -10 to -11 with the live source unreachable", async () => {
+    await Promise.all([writeFile(packagedSeedOne, anulIBytes), writeFile(packagedSeedTwo, anulIIBytes)]);
+    const [before, beforeTwo] = await Promise.all([
+      persistPreviousSeed(1, PREVIOUS_ANUL_I_SEED, PREVIOUS_ANUL_I_URL),
+      persistPreviousSeed(2, PREVIOUS_ANUL_II_SEED, PREVIOUS_ANUL_II_URL),
+    ]);
+    expect(before.lessons).toHaveLength(451);
+    expect(beforeTwo.lessons).toHaveLength(288);
+
+    stubFetch(cloudflareBlocked());
+
+    // Discovery still fails. Promotion is independent of it.
+    expect((await checkForUpdates(1)).outcome).toBe("error");
+    expect((await checkForUpdates(2)).outcome).toBe("error");
+
+    const [one, two] = await Promise.all([getCurrentSchedule(1), getCurrentSchedule(2)]);
+    expect(one?.metadata).toMatchObject({
+      source_pdf_url: ANUL_I_URL,
+      source_pdf_hash: ANUL_I_HASH,
+      source_kind: "seed",
+      course_year: 1,
+      semester: "Semestrul I",
+    });
+    expect(one?.groups).toHaveLength(41);
+    expect(one?.lessons).toHaveLength(452);
+    expect(one?.lessons.filter((lesson) => lesson.uncertain)).toHaveLength(0);
+
+    expect(two?.metadata).toMatchObject({
+      source_pdf_url: ANUL_II_URL,
+      source_pdf_hash: ANUL_II_HASH,
+      source_kind: "seed",
+      course_year: 2,
+      semester: "Semestrul III",
+    });
+    expect(two?.groups).toHaveLength(26);
+    expect(two?.lessons).toHaveLength(288);
+    expect(two?.lessons.filter((lesson) => lesson.uncertain)).toHaveLength(0);
+
+    // Each course's recorded source moved to its own new document.
+    expect((await getSourceState(1)).current_pdf_url).toBe(ANUL_I_URL);
+    expect((await getSourceState(1)).current_pdf_hash).toBe(ANUL_I_HASH);
+    expect((await getSourceState(2)).current_pdf_url).toBe(ANUL_II_URL);
+    expect((await getSourceState(2)).current_pdf_hash).toBe(ANUL_II_HASH);
+  });
+
+  it("keeps a persisted seed that is already the packaged revision", async () => {
+    await writeFile(packagedSeedOne, anulIBytes);
+    await persistPreviousSeed(1, ANUL_I_SEED, ANUL_I_URL);
+    stubFetch(cloudflareBlocked());
+
+    expect((await checkForUpdates(1)).outcome).toBe("error");
+    const served = await getCurrentSchedule(1);
+    expect(served?.metadata).toMatchObject({ source_pdf_url: ANUL_I_URL, source_pdf_hash: ANUL_I_HASH });
+    expect(served?.lessons).toHaveLength(452);
   });
 });

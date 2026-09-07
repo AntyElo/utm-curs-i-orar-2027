@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NextRequest } from "next/server";
 
-const NEW_SEED_HASH = "52e7f14be27a996e17d0614c1f9fe769d63bdf76876fce6d4fc60f026bf8c015";
+const NEW_SEED_HASH = "a4c610d24dd53bbf87c5da312ffebf7aabc112c7f28338587e18e1eb0526b79a";
 const tempDir = await mkdtemp(path.join(tmpdir(), "fcim-test-"));
 const packagedSeedPath = path.join(tempDir, "packaged-seed.pdf");
 process.env.SCHEDULE_DATA_DIR = tempDir;
@@ -12,7 +12,7 @@ process.env.DATABASE_URL = "";
 process.env.SCHEDULE_WAYBACK_FALLBACK = "0";
 process.env.SCHEDULE_SEED_PDF = packagedSeedPath;
 process.env.SCHEDULE_ADMIN_TOKEN = "test-admin-token";
-const SEED_MIRROR_URL = "https://raw.githubusercontent.com/barbalatv/utm-curs-i-orar-2027/main/data/seed/anul_i_semestrul_i-9.pdf";
+const SEED_MIRROR_URL = "https://raw.githubusercontent.com/barbalatv/utm-curs-i-orar-2027/main/data/seed/anul_i_semestrul_i-18.pdf";
 process.env.SCHEDULE_SEED_PDF_MIRROR_URL = SEED_MIRROR_URL;
 process.env.SCHEDULE_SEED_PDF_SHA256 = NEW_SEED_HASH;
 
@@ -38,12 +38,12 @@ const PAGE_FIXTURE = path.join(__dirname, "fixtures", "orar-page.html");
 const PDF_FIXTURE = path.join(__dirname, "fixtures", "anul_i_semestrul_ii-1.pdf");
 const PDF_FIXTURE_B = path.join(__dirname, "fixtures", "anul_i_semestrul_i-3.pdf");
 const OLD_SEED_FIXTURE = path.join(__dirname, "fixtures", "anul_i_semestrul_i-5.pdf");
-const NEW_SEED_FIXTURE = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-9.pdf");
+const NEW_SEED_FIXTURE = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-18.pdf");
 const PAGE_URL = "https://fcim.utm.md/procesul-de-studii/orar/";
 const WORDPRESS_URL = "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view";
 const PDF_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/03/anul_i_semestrul_ii-1.pdf";
 const OLD_SEED_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-5.pdf";
-const NEW_SEED_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf";
+const NEW_SEED_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf";
 const SPRING_2026 = new Date("2026-03-01T12:00:00.000Z");
 
 let pageHtml: string;
@@ -688,7 +688,7 @@ describe("test_remote_seed_bootstrap", () => {
     const schedule = await getCurrentSchedule(1);
     expect(schedule?.metadata).toMatchObject({ course_year: 1, source_kind: "seed", source_pdf_hash: NEW_SEED_HASH });
     expect(schedule?.groups).toHaveLength(41);
-    expect(schedule?.lessons).toHaveLength(449);
+    expect(schedule?.lessons).toHaveLength(452);
     // A seed on disk means the repository mirror is never contacted.
     expect(calls.some((call) => call.url === SEED_MIRROR_URL)).toBe(false);
     expect((await getSourceState(1))).toMatchObject({ last_result: "seeded", current_pdf_url: NEW_SEED_URL });
@@ -715,7 +715,7 @@ describe("test_remote_seed_bootstrap", () => {
     expect(schedule?.metadata.source_pdf_hash).toBe(NEW_SEED_HASH);
     expect(schedule?.metadata.course_year).toBe(1);
     expect(schedule?.groups).toHaveLength(41);
-    expect(schedule?.lessons).toHaveLength(449);
+    expect(schedule?.lessons).toHaveLength(452);
   });
 
   it("rejects changed mirror bytes without claiming the official seed provenance", async () => {
@@ -867,7 +867,7 @@ describe("authenticated explicit-PDF recovery", () => {
     stubFetch({
       [NEW_SEED_URL]: {
         body: newSeedBytes,
-        headers: { "content-type": "application/pdf", etag: '"seed-9"' },
+        headers: { "content-type": "application/pdf", etag: '"seed-16"' },
       },
     });
     const result = await responseJson<{
@@ -882,7 +882,7 @@ describe("authenticated explicit-PDF recovery", () => {
       pdf_url: NEW_SEED_URL,
       source_pdf_hash: NEW_SEED_HASH,
       groups: 41,
-      lessons: 449,
+      lessons: 452,
     });
 
     const served = await getCurrentSchedule(1);
@@ -892,7 +892,7 @@ describe("authenticated explicit-PDF recovery", () => {
       source_kind: "manual",
     });
     expect(served?.groups).toHaveLength(41);
-    expect(served?.lessons).toHaveLength(449);
+    expect(served?.lessons).toHaveLength(452);
     expect(validateSchedule(served!, { previousLessonCount: old.lessons.length }).ok).toBe(true);
 
     const state = await getSourceState(1);
@@ -909,7 +909,7 @@ describe("authenticated explicit-PDF recovery", () => {
       source_pdf_hash: NEW_SEED_HASH,
       source_kind: "manual",
       groups: 41,
-      lessons: 449,
+      lessons: 452,
     });
     expect(status.source.last_result).toBe("error");
     expect(status.source.last_error).toMatch(/Cloudflare challenge/);
@@ -917,7 +917,7 @@ describe("authenticated explicit-PDF recovery", () => {
 });
 
 describe("packaged seed promotion", () => {
-  it("promotes persisted -5 seed to validated -9 seed even when discovery is challenged", async () => {
+  it("promotes persisted -5 seed to validated -18 seed even when discovery is challenged", async () => {
     await writeFile(packagedSeedPath, newSeedBytes);
     await persistOldSchedule("seed");
     stubFetch(cloudflareDiscoveryRoutes());
@@ -933,7 +933,7 @@ describe("packaged seed promotion", () => {
       source_kind: "seed",
     });
     expect(served?.groups).toHaveLength(41);
-    expect(served?.lessons).toHaveLength(449);
+    expect(served?.lessons).toHaveLength(452);
     expect(served?.lessons.filter((lesson) => lesson.uncertain)).toHaveLength(0);
 
     const status = await buildStatus(1);
@@ -941,7 +941,7 @@ describe("packaged seed promotion", () => {
       source_pdf_url: NEW_SEED_URL,
       source_pdf_hash: NEW_SEED_HASH,
       groups: 41,
-      lessons: 449,
+      lessons: 452,
     });
     expect(status.source).toMatchObject({
       current_pdf_url: NEW_SEED_URL,

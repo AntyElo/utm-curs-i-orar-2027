@@ -45,7 +45,7 @@ const source = (await import("@/app/api/source/route")).GET;
 const adminRefresh = (await import("@/app/api/admin/refresh/route")).POST;
 
 /** The bundled real FCIM PDF: autumn 2026/2027, the schedule the app ships with. */
-const SEED = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-9.pdf");
+const SEED = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-18.pdf");
 /** A lesson recorded from that PDF – present iff the whole chain kept the data intact. */
 const KNOWN_GROUP = "SI-261";
 const KNOWN_LESSON = { day: "Luni", start_time: "11:30", subject: "Analiza Matematică", teacher: "Costaș A." };

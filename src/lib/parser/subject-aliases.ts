@@ -73,6 +73,9 @@ export const KNOWN_SUBJECT_TYPO_ALIASES = new Map<string, string>([
   ["ESM", "Etică și securitatea umană"],
   ["SMM", "Securitatea și sănătatea în muncă"],
   ["Tehnici de pogramare aplicată", "Tehnici de programare aplicată"],
+  // A misplaced space in anul_i_semestrul_i-16.pdf ("Tehnici d eprogramare"). Corrected as
+  // one exact string, not by repairing spaces generally: only this wording is confirmed.
+  ["Tehnici d eprogramare", "Tehnici de programare"],
 
   // Confirmed Anul II spelling and truncation variants
   ["Progromarea Orientată pe Obiecte", "Programarea orientată pe obiecte"],
@@ -121,6 +124,9 @@ export const KNOWN_SUBJECT_TYPO_ALIASES = new Map<string, string>([
   // 4. Ed. Fizică → Educație fizică
   ["Ed. Fizică", "Educație fizică"],
   ["Ed. fizică", "Educație fizică"],
+  // The articulated spelling one cell of anul_i_semestrul_i-16.pdf uses for the same
+  // discipline; the UTM curriculum names it "Educație fizică".
+  ["Educația fizică", "Educație fizică"],
 
   // 5. Fizica → Fizică
   ["Fizica", "Fizică"],

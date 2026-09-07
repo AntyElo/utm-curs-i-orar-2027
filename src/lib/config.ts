@@ -73,7 +73,7 @@ export const config = {
   minLessons: 30,
   /** Bump on every parser behaviour change: a cached schedule parsed by an older
    *  version is re-parsed on the next check even when the PDF itself is unchanged. */
-  parserVersion: "1.1.0",
+  parserVersion: "1.3.0",
   timezone: "Europe/Chisinau",
   databaseUrl: process.env.DATABASE_URL ?? "",
 } as const;

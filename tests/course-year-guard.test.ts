@@ -17,11 +17,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { NextRequest } from "next/server";
 import type { Schedule } from "@/lib/models";
 
-const SEED_HASH = "52e7f14be27a996e17d0614c1f9fe769d63bdf76876fce6d4fc60f026bf8c015";
+const SEED_HASH = "a4c610d24dd53bbf87c5da312ffebf7aabc112c7f28338587e18e1eb0526b79a";
 const SEED_MIRROR_URL =
-  "https://raw.githubusercontent.com/barbalatv/utm-curs-i-orar-2027/main/data/seed/anul_i_semestrul_i-9.pdf";
+  "https://raw.githubusercontent.com/barbalatv/utm-curs-i-orar-2027/main/data/seed/anul_i_semestrul_i-18.pdf";
 const ANUL_II_MIRROR_URL =
-  "https://raw.githubusercontent.com/barbalatv/utm-curs-i-orar-2027/main/data/seed/anul_ii_semestrul_iii-8.pdf";
+  "https://raw.githubusercontent.com/barbalatv/utm-curs-i-orar-2027/main/data/seed/anul_ii_semestrul_iii-11.pdf";
 const tempDir = await mkdtemp(path.join(tmpdir(), "fcim-course2-"));
 const packagedSeedPath = path.join(tempDir, "packaged-seed.pdf");
 /** Anul II's own packaged seed slot; these tests control what is placed in it. */
@@ -48,14 +48,14 @@ const scheduleRoute = (await import("@/app/api/schedule/route")).GET;
 const adminRefresh = (await import("@/app/api/admin/refresh/route")).POST;
 
 /** The bundled Anul I PDF, i.e. the seed Anul II must never receive. */
-const ANUL_I_SEED = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-9.pdf");
+const ANUL_I_SEED = path.join(__dirname, "..", "data", "seed", "anul_i_semestrul_i-18.pdf");
 /** An older published Anul I timetable, used as pre-existing cache content. */
 const ANUL_I_OLD = path.join(__dirname, "fixtures", "anul_i_semestrul_i-5.pdf");
 const PAGE_URL = "https://fcim.utm.md/procesul-de-studii/orar/";
 const WORDPRESS_URL = "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view";
 const OLD_SEED_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-5.pdf";
-const NEW_SEED_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf";
-const ANUL_II_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-8.pdf";
+const NEW_SEED_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf";
+const ANUL_II_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-11.pdf";
 const AUTUMN_2026 = new Date("2026-09-15T12:00:00.000Z");
 
 let seedBytes: Uint8Array;

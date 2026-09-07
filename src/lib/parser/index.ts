@@ -8,6 +8,7 @@ import { config } from "@/lib/config";
 import { DEFAULT_COURSE_YEAR } from "@/lib/courses";
 import { getLogger } from "@/lib/logger";
 import type { Schedule, ScheduleMetadata } from "@/lib/models";
+import { repairTruncatedColumnBorders, type BoundaryRepair } from "./boundary-repair";
 import { buildCells, type TableCell } from "./cell-builder";
 import { buildGrid, type Grid } from "./geometry";
 import { interpretCell } from "./lesson-interpreter";
@@ -41,6 +42,8 @@ export interface ParseArtifacts {
   layout: TableLayout;
   cells: TableCell[];
   orphans: TableCell[];
+  /** Clipped column borders restored before cell reconstruction; empty for a well-formed PDF. */
+  border_repairs: BoundaryRepair[];
 }
 
 const TITLE_RE = /ANUL UNIVERSITAR\s+(\d{4}\s*[/-]\s*\d{4}),?\s*ANUL\s+([IVX]+),?\s*SEMESTRUL\s+([IVX]+)/i;
@@ -56,14 +59,21 @@ export async function parsePdf(pdfBytes: Uint8Array, provenance: Provenance): Pr
     return { page, grid, layout };
   });
   const best = perPage.reduce((acc, item) => (item.layout.groups.length > acc.layout.groups.length ? item : acc));
-  const { page, grid, layout } = best;
+  const { page, layout } = best;
+  // Layout is detected on the borders as drawn; cells are reconstructed on the borders
+  // as intended, with clipped column-border stubs restored (see boundary-repair).
+  const { grid, repairs } = repairTruncatedColumnBorders(best.grid, layout);
 
   log.info("layout detected", {
     page: page.page,
     groups: layout.groups.length,
     days: layout.days.length,
     rows: layout.rows.length,
+    repaired_borders: repairs.length,
   });
+  for (const repair of repairs) {
+    log.info("column border restored", { x: repair.x, day: repair.day, slot: repair.start_time, gap: Number(repair.gap.toFixed(2)) });
+  }
 
   const { cells, orphans } = buildCells(page.texts, grid, layout, page.page);
   const lessons = cells.flatMap(interpretCell).sort(compareLessons);
@@ -100,7 +110,7 @@ export async function parsePdf(pdfBytes: Uint8Array, provenance: Provenance): Pr
     warnings,
   };
 
-  return { schedule, pages, grid, layout, cells, orphans };
+  return { schedule, pages, grid, layout, cells, orphans, border_repairs: repairs };
 }
 
 export function sha256(bytes: Uint8Array): string {

@@ -46,7 +46,7 @@ HTML and Cloudflare challenge responses are rejected.
 ```bash
 export APP_URL=https://utm-curs-i-orar-2027.onrender.com
 export COURSE=1
-export PDF_URL=https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf
+export PDF_URL=https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf
 curl -fsS -X POST "$APP_URL/api/admin/refresh" \
   -H "Authorization: Bearer $SCHEDULE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
@@ -93,9 +93,9 @@ published.
   "metadata": {
     "academic_year": "2026/2027", "semester": "Semestrul I", "course_year": 1,
     "source_page_url": "https://fcim.utm.md/procesul-de-studii/orar/",
-    "source_pdf_url": "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
+    "source_pdf_url": "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
     "source_pdf_hash": "sha256…", "source_kind": "live | wayback | seed | manual",
-    "downloaded_at": "…", "parsed_at": "…", "parser_version": "1.1.0",
+    "downloaded_at": "…", "parsed_at": "…", "parser_version": "1.3.0",
     "etag": null, "last_modified": null, "pdf_title": "ANUL UNIVERSITAR 2026/2027, ANUL I, SEMESTRUL I"
   },
   "groups": [{ "name": "SI-261", "program": "SI", "x0": 52.6, "x1": 79.8 }],

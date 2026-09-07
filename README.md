@@ -166,14 +166,16 @@ Provenance of the committed copies, all retrieved from the official source:
 
 | File | Origin | Role |
 | --- | --- | --- |
-| `data/seed/anul_i_semestrul_i-9.pdf` | `fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf` | Anul I cold-start seed (SHA-256 `52e7f14b…8c015`); also the Anul I regression fixture |
-| `data/seed/anul_ii_semestrul_iii-8.pdf` | `fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-8.pdf` | Anul II cold-start seed (SHA-256 `35b0ce85…19187`); also the Anul II regression fixture — one copy serves both roles |
-| `tests/fixtures/anul_i_semestrul_i-{3,5}.pdf`, `anul_i_semestrul_ii-1.pdf` | same host, earlier publications | parser regression fixtures, test-only |
+| `data/seed/anul_i_semestrul_i-18.pdf` | `fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf` | Anul I cold-start seed (SHA-256 `a4c610d2…b79a`) |
+| `data/seed/anul_ii_semestrul_iii-11.pdf` | `fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-11.pdf` | Anul II cold-start seed (SHA-256 `3728f5ab…a23b`) |
+| `tests/fixtures/anul_i_semestrul_i-16.pdf`, `anul_ii_semestrul_iii-10.pdf` | same host, the previously shipped seeds | seed-promotion & repair fixtures: the persisted revision each course is promoted *from*, test-only |
+| `tests/fixtures/anul_i_semestrul_i-{3,5,9}.pdf`, `anul_ii_semestrul_iii-8.pdf`, `anul_i_semestrul_ii-1.pdf` | same host, earlier publications | parser regression fixtures, test-only |
 | `tests/fixtures/orar-page-autumn-2026.html`, `orar-page.html` | `fcim.utm.md/procesul-de-studii/orar/` | discovery fixtures, test-only |
 
 Nothing under `tests/` is loaded at runtime or shipped in the container image (see
-`.dockerignore`). The two files under `data/seed/` are the exception and are deliberately dual-role:
-each is the cold-start fallback its course installs when FCIM is unreachable *and* the fixture its
-regression tests parse, so there is exactly one copy of each PDF in the repository. A seed is only
-ever a fallback — the live PDF discovered on the official page always wins, and a seed is never
-installed for a course whose year it does not match.
+`.dockerignore`). `data/seed/` holds exactly the two PDFs the deployment actually serves — one per
+course — so the image ships no revision it would never install. A superseded seed is not deleted:
+it moves to `tests/fixtures/`, where it keeps proving that a volume still holding that older
+revision is promoted forward to the packaged one. A seed is only ever a fallback — the live PDF
+discovered on the official page always wins, and a seed is never installed for a course whose year
+it does not match.
