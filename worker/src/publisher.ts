@@ -129,8 +129,8 @@ export async function publishCandidateSnapshot(
   let pageApiEtag = pageApiResponse.headers.get("ETag");
   let pageApiLastModified = pageApiResponse.headers.get("Last-Modified");
 
-  // Step 9: PDF freshness check when page API itself is unchanged (304)
-  if (!options.force && pageApiNotModified && previousManifest) {
+  if (pageApiNotModified && previousManifest) {
+    // If upstream Page API returned HTTP 304, we need full body if a PDF changed
     let pdfChanged = false;
     for (const file of previousManifest.files) {
       try {
@@ -148,10 +148,10 @@ export async function publishCandidateSnapshot(
       }
     }
 
-    if (!pdfChanged) {
+    if (!options.force && !pdfChanged) {
       return { published: false, reason: "unchanged (page 304 and PDFs 304)" };
     }
-    // A PDF changed! We must proceed with new publication. Fetch full Page API body.
+    // A PDF changed or force! Fetch full Page API body.
     const fullPageRes = await fetch(pageApiUrl, { headers: { Accept: "application/json" } });
     if (!fullPageRes.ok) {
       return { published: false, error: `Failed to fetch full Page API: HTTP ${fullPageRes.status}` };
@@ -183,6 +183,38 @@ export async function publishCandidateSnapshot(
 
   if (typeof renderedContent !== "string") {
     return { published: false, error: "Page API payload has no rendered content" };
+  }
+
+  // Step 4: Check if WordPress page and all PDFs are unchanged
+  const pageUnchanged =
+    pageApiNotModified ||
+    Boolean(
+      previousManifest &&
+        pageModifiedGmt &&
+        previousManifest.source.page_modified_gmt === pageModifiedGmt,
+    );
+
+  if (!options.force && pageUnchanged && previousManifest) {
+    let pdfChanged = false;
+    for (const file of previousManifest.files) {
+      try {
+        const condHeaders: HeadersInit = {};
+        if (file.upstream_etag) condHeaders["If-None-Match"] = file.upstream_etag;
+        if (file.upstream_last_modified) condHeaders["If-Modified-Since"] = file.upstream_last_modified;
+
+        const headRes = await fetchSafePdf(file.source_url, condHeaders);
+        if (headRes.status === 200) {
+          pdfChanged = true;
+          break;
+        }
+      } catch (err) {
+        console.warn(`Conditional check failed for ${file.source_url}:`, err);
+      }
+    }
+
+    if (!pdfChanged) {
+      return { published: false, reason: "unchanged (page and PDFs 304/unchanged)" };
+    }
   }
 
   // Step 4: Identify valid official timetable PDF URLs

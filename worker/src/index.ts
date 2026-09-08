@@ -107,7 +107,8 @@ const worker = {
       }
       const force = url.searchParams.get("force") === "1" || url.searchParams.get("force") === "true";
       const result = await publishCandidateSnapshot(env, { force });
-      return jsonResponse(result, result.published ? 200 : (result.conflict ? 409 : 500));
+      const status = result.published || result.reason ? 200 : (result.conflict ? 409 : 500);
+      return jsonResponse(result, status);
     }
 
     // Health check
