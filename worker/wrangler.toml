@@ -1,6 +1,7 @@
 name = "fcim-schedule-broker"
 main = "src/index.ts"
 compatibility_date = "2024-09-01"
+minify = true
 
 # Bind R2 bucket for candidate snapshots and accepted state
 [[r2_buckets]]

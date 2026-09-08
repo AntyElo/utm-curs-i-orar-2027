@@ -113,6 +113,15 @@ export class MockR2Bucket implements R2Bucket {
             return null;
           }
         }
+        if (cond.etagDoesNotMatch) {
+          if (cond.etagDoesNotMatch === "*" && existing) {
+            // Object exists but etagDoesNotMatch: * requested -> Precondition failed
+            return null;
+          }
+          if (existing && existing.etag === cond.etagDoesNotMatch) {
+            return null;
+          }
+        }
       }
     }
 

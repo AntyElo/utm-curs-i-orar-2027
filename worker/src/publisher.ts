@@ -22,6 +22,8 @@ import type {
   CurrentPointer,
   Env,
   PublishResult,
+  R2Object,
+  R2ObjectBody,
   R2PutOptions,
   SnapshotFile,
   SnapshotManifest,
@@ -29,7 +31,7 @@ import type {
 
 const DEFAULT_PAGE_API_URL = "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view";
 const MAX_PDF_BYTES = 25 * 1024 * 1024; // 25 MB cap
-const IF_NONE_MATCH_HEADERS = new Headers({ "If-None-Match": "*" });
+const IF_NONE_MATCH_COND = { etagDoesNotMatch: "*" };
 
 /**
  * Generate a collision-safe snapshot identifier.
@@ -41,10 +43,19 @@ export function generateSnapshotId(now = new Date()): string {
   return `${iso}-${randomSuffix}`;
 }
 
+const BASE_PDF_FETCH_OPTIONS = {
+  method: "GET",
+  redirect: "manual" as const,
+  cf: {
+    cacheEverything: true,
+    cacheTtl: 3600,
+  },
+};
+
 /**
  * Safe fetch with redirect validation against strict official timetable URL policy.
  */
-async function fetchSafePdf(url: string, headers: HeadersInit = {}): Promise<Response> {
+async function fetchSafePdf(url: string, headers?: HeadersInit): Promise<Response> {
   let currentUrl = url;
   let redirects = 0;
   const maxRedirects = 5;
@@ -54,13 +65,14 @@ async function fetchSafePdf(url: string, headers: HeadersInit = {}): Promise<Res
       throw new Error(`Unsafe PDF URL rejected by allowlist: ${currentUrl}`);
     }
 
-    const response = await fetch(currentUrl, {
-      method: "GET",
-      headers,
-      redirect: "manual",
-    });
+    const fetchOptions = headers
+      ? { ...BASE_PDF_FETCH_OPTIONS, headers }
+      : BASE_PDF_FETCH_OPTIONS;
 
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
+    const response = await fetch(currentUrl, fetchOptions as RequestInit);
+
+    const status = response.status;
+    if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
       const location = response.headers.get("Location");
       if (!location) {
         throw new Error(`Redirect from ${currentUrl} has no Location header`);
@@ -77,6 +89,53 @@ async function fetchSafePdf(url: string, headers: HeadersInit = {}): Promise<Res
 }
 
 /**
+ * Transport-level course categories supported by the schedule system.
+ * Currently supports Licență Course 1 (Anul I) and Course 2 (Anul II).
+ * Future course expansion (e.g. Anul III, Anul IV) is explicitly configurable.
+ */
+export const DEFAULT_TRANSPORT_COURSES = [1, 2] as const;
+
+const COURSE_ROMAN_MAP: Record<number, string> = {
+  1: "i",
+  2: "ii",
+  3: "iii",
+  4: "iv",
+};
+
+const DEFAULT_SUPPORTED_COURSE_REGEX = /\/anul_(?:i|ii)[_.-].*\.pdf$/i;
+
+/**
+ * Pure transport-level filter ensuring all candidate PDFs for supported courses
+ * are transported into the candidate snapshot.
+ *
+ * Invariants preserved:
+ * 1. Render's discoverPdf() remains the sole semantic authority.
+ * 2. Every candidate that discoverPdf() could select for supported courses is guaranteed present.
+ * 3. Master and session timetables are not undergraduate course timetables and cannot be substituted.
+ * 4. Future extension remains explicit (by expanding supportedCourseYears).
+ * 5. Does NOT select by revision or filename ("highest revision" selection is forbidden).
+ */
+export function filterSupportedCoursePdfs(
+  pdfUrls: string[],
+  supportedCourseYears: readonly number[] = DEFAULT_TRANSPORT_COURSES,
+): string[] {
+  if (supportedCourseYears.length === 0) return pdfUrls;
+
+  const regex =
+    supportedCourseYears === DEFAULT_TRANSPORT_COURSES
+      ? DEFAULT_SUPPORTED_COURSE_REGEX
+      : new RegExp(
+          `/anul_(?:${supportedCourseYears.map((y) => COURSE_ROMAN_MAP[y]).filter(Boolean).join("|")})[_.-].*\\.pdf$`,
+          "i",
+        );
+
+  const filtered = pdfUrls.filter((url) => regex.test(url));
+
+  // Fail-safe: if pattern matching returned nothing, retain all official PDFs so discoverPdf is never starved.
+  return filtered.length > 0 ? filtered : pdfUrls;
+}
+
+/**
  * Execute candidate publication pipeline.
  */
 export async function publishCandidateSnapshot(
@@ -84,47 +143,76 @@ export async function publishCandidateSnapshot(
   options: { force?: boolean } = {},
 ): Promise<PublishResult> {
   const pageApiUrl = env.FCIM_PAGE_API_URL ?? DEFAULT_PAGE_API_URL;
-  if (!isAllowedPageApiUrl(pageApiUrl)) {
+  if (pageApiUrl !== DEFAULT_PAGE_API_URL && !isAllowedPageApiUrl(pageApiUrl)) {
     return { published: false, error: `Invalid Page API URL: ${pageApiUrl}` };
   }
 
-  // Step 1 & 2: Read current.json metadata / ETag and resolve previous_snapshot_id
-  const currentObj = await env.R2_BUCKET.get("current.json");
-  const currentEtag = currentObj?.etag ?? null;
+  let currentObj: R2ObjectBody | null = null;
+  let pageApiResponse: Response;
+  let currentEtag: string | null = null;
   let previousSnapshotId: string | null = null;
   let previousManifest: SnapshotManifest | null = null;
 
-  if (currentObj) {
+  if (options.force) {
     try {
-      const currentPointer = (await currentObj.json()) as CurrentPointer;
-      previousSnapshotId = currentPointer.snapshot_id;
-      if (!options.force && currentPointer.manifest_r2_key) {
-        const prevManifestObj = await env.R2_BUCKET.get(currentPointer.manifest_r2_key);
-        if (prevManifestObj) {
-          previousManifest = (await prevManifestObj.json()) as SnapshotManifest;
+      const [cObj, pRes] = await Promise.all([
+        env.R2_BUCKET.get("current.json"),
+        fetch(pageApiUrl, {
+          headers: { Accept: "application/json" },
+          cf: { cacheTtl: 60 },
+        } as RequestInit),
+      ]);
+      currentObj = cObj;
+      pageApiResponse = pRes;
+      currentEtag = currentObj?.etag ?? null;
+      if (currentObj) {
+        try {
+          const text = await currentObj.text();
+          const match = /"snapshot_id"\s*:\s*"([^"]+)"/.exec(text);
+          if (match) {
+            previousSnapshotId = match[1];
+          }
+        } catch (err) {
+          console.warn("Failed to parse existing current.json:", err);
         }
       }
     } catch (err) {
-      console.warn("Failed to parse existing current.json or manifest:", err);
+      return { published: false, error: `Failed to fetch FCIM Page API: ${(err as Error).message}` };
     }
-  }
+  } else {
+    currentObj = await env.R2_BUCKET.get("current.json");
+    currentEtag = currentObj?.etag ?? null;
 
-  // Step 3: Fetch authoritative FCIM Page API (with conditional headers when available)
-  const pageHeaders: Record<string, string> = {
-    Accept: "application/json",
-  };
-  if (!options.force && previousManifest?.source.etag) {
-    pageHeaders["If-None-Match"] = previousManifest.source.etag;
-  }
-  if (!options.force && previousManifest?.source.last_modified) {
-    pageHeaders["If-Modified-Since"] = previousManifest.source.last_modified;
-  }
+    if (currentObj) {
+      try {
+        const currentPointer = (await currentObj.json()) as CurrentPointer;
+        previousSnapshotId = currentPointer.snapshot_id;
+        if (currentPointer.manifest_r2_key) {
+          const prevManifestObj = await env.R2_BUCKET.get(currentPointer.manifest_r2_key);
+          if (prevManifestObj) {
+            previousManifest = (await prevManifestObj.json()) as SnapshotManifest;
+          }
+        }
+      } catch (err) {
+        console.warn("Failed to parse existing current.json or manifest:", err);
+      }
+    }
 
-  let pageApiResponse: Response;
-  try {
-    pageApiResponse = await fetch(pageApiUrl, { headers: pageHeaders });
-  } catch (err) {
-    return { published: false, error: `Failed to fetch FCIM Page API: ${(err as Error).message}` };
+    const pageHeaders: Record<string, string> = {
+      Accept: "application/json",
+    };
+    if (previousManifest?.source.etag) {
+      pageHeaders["If-None-Match"] = previousManifest.source.etag;
+    }
+    if (previousManifest?.source.last_modified) {
+      pageHeaders["If-Modified-Since"] = previousManifest.source.last_modified;
+    }
+
+    try {
+      pageApiResponse = await fetch(pageApiUrl, { headers: pageHeaders });
+    } catch (err) {
+      return { published: false, error: `Failed to fetch FCIM Page API: ${(err as Error).message}` };
+    }
   }
 
   let pageApiNotModified = pageApiResponse.status === 304;
@@ -243,19 +331,26 @@ export async function publishCandidateSnapshot(
     }
   }
 
-  // Step 4: Identify valid official timetable PDF URLs
-  const pdfUrls = extractOfficialPdfUrls(renderedContent);
-  if (pdfUrls.length === 0) {
+  // Step 4: Identify valid official timetable PDF URLs and apply transport filter
+  const allPdfUrls = extractOfficialPdfUrls(renderedContent);
+  if (allPdfUrls.length === 0) {
     return { published: false, error: "No official timetable PDF URLs found in Page API rendered content" };
   }
-
+  const pdfUrls = filterSupportedCoursePdfs(allPdfUrls);
   const snapshotId = generateSnapshotId();
   const snapshotCreated = new Date().toISOString();
+  const pageApiKey = `snapshots/${snapshotId}/page-api.json`;
 
-  // Step 5: Write all new immutable PDF objects via streaming with create-only semantics (concurrent)
+  // Step 5: Write all new immutable PDF objects and page-api.json concurrently via streaming with create-only semantics
   let snapshotFiles: SnapshotFile[];
+  let pageApiWritten: R2Object | null;
   try {
-    snapshotFiles = await Promise.all(
+    const pageApiPutPromise = env.R2_BUCKET.put(pageApiKey, pageApiRawText, {
+      onlyIf: IF_NONE_MATCH_COND,
+      httpMetadata: { contentType: "application/json" },
+    });
+
+    const pdfsPromise = Promise.all(
       pdfUrls.map(async (pdfUrl) => {
         const filename = getPdfFilename(pdfUrl);
         const r2Key = `snapshots/${snapshotId}/pdfs/${filename}`;
@@ -265,32 +360,23 @@ export async function publishCandidateSnapshot(
           throw new Error(`PDF ${pdfUrl} returned HTTP ${pdfRes.status}`);
         }
 
-        // Sanity checks on headers
-        const contentType = pdfRes.headers.get("Content-Type");
-        const contentLength = pdfRes.headers.get("Content-Length");
-        const sizeBytes = contentLength ? Number(contentLength) : null;
-        if (sizeBytes !== null && sizeBytes > MAX_PDF_BYTES) {
-          throw new Error(`PDF ${pdfUrl} exceeds size limit (${sizeBytes} bytes)`);
-        }
-
-        const upstreamEtag = pdfRes.headers.get("ETag");
-        const upstreamLastModified = pdfRes.headers.get("Last-Modified");
-
         if (!pdfRes.body) {
           throw new Error(`PDF ${pdfUrl} returned empty body`);
         }
 
-        // Stream directly into R2.put() with If-None-Match: * (create-only)
+        const upstreamEtag = pdfRes.headers.get("ETag");
+        const upstreamLastModified = pdfRes.headers.get("Last-Modified");
+        const contentType = pdfRes.headers.get("Content-Type") || "application/pdf";
+        const contentLength = pdfRes.headers.get("Content-Length");
+        const sizeBytes = contentLength ? Number.parseInt(contentLength, 10) : null;
+        if (sizeBytes !== null && sizeBytes > MAX_PDF_BYTES) {
+          throw new Error(`PDF ${pdfUrl} exceeds size limit (${sizeBytes} bytes)`);
+        }
+
+        // Stream directly into R2 with etagDoesNotMatch: * (create-only)
         const r2Put = await env.R2_BUCKET.put(r2Key, pdfRes.body, {
-          onlyIf: IF_NONE_MATCH_HEADERS,
-          httpMetadata: {
-            contentType: contentType ?? "application/pdf",
-          },
-          customMetadata: {
-            source_url: pdfUrl,
-            upstream_etag: upstreamEtag ?? "",
-            upstream_last_modified: upstreamLastModified ?? "",
-          },
+          onlyIf: IF_NONE_MATCH_COND,
+          httpMetadata: { contentType },
         });
 
         if (!r2Put) {
@@ -308,6 +394,11 @@ export async function publishCandidateSnapshot(
         };
       }),
     );
+
+    [snapshotFiles, pageApiWritten] = await Promise.all([
+      pdfsPromise,
+      pageApiPutPromise,
+    ]);
   } catch (err) {
     const msg = (err as Error).message;
     if (msg.startsWith("COLLISION:")) {
@@ -323,8 +414,15 @@ export async function publishCandidateSnapshot(
     };
   }
 
-  // Step 6 & 7: Write page-api.json and manifest.json with create-only semantics concurrently
-  const pageApiKey = `snapshots/${snapshotId}/page-api.json`;
+  if (!pageApiWritten) {
+    return {
+      published: false,
+      conflict: true,
+      error: `Collision: ${pageApiKey} already exists under immutable snapshot`,
+    };
+  }
+
+  // Step 6: Write manifest.json with create-only semantics
   const manifest: SnapshotManifest = {
     schema_version: 1,
     snapshot_id: snapshotId,
@@ -342,24 +440,10 @@ export async function publishCandidateSnapshot(
   };
   const manifestKey = `snapshots/${snapshotId}/manifest.json`;
 
-  const [pageApiWritten, manifestWritten] = await Promise.all([
-    env.R2_BUCKET.put(pageApiKey, pageApiRawText, {
-      onlyIf: IF_NONE_MATCH_HEADERS,
-      httpMetadata: { contentType: "application/json" },
-    }),
-    env.R2_BUCKET.put(manifestKey, JSON.stringify(manifest), {
-      onlyIf: IF_NONE_MATCH_HEADERS,
-      httpMetadata: { contentType: "application/json" },
-    }),
-  ]);
-
-  if (!pageApiWritten) {
-    return {
-      published: false,
-      conflict: true,
-      error: `Collision: ${pageApiKey} already exists under immutable snapshot`,
-    };
-  }
+  const manifestWritten = await env.R2_BUCKET.put(manifestKey, JSON.stringify(manifest), {
+    onlyIf: IF_NONE_MATCH_COND,
+    httpMetadata: { contentType: "application/json" },
+  });
 
   if (!manifestWritten) {
     return {
@@ -379,7 +463,7 @@ export async function publishCandidateSnapshot(
 
   const putOptions: R2PutOptions = currentEtag
     ? { onlyIf: { etagMatches: currentEtag } }
-    : { onlyIf: IF_NONE_MATCH_HEADERS };
+    : { onlyIf: IF_NONE_MATCH_COND };
 
   const casResult = await env.R2_BUCKET.put(
     "current.json",

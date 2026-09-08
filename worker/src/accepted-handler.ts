@@ -23,16 +23,17 @@ import type {
 const SAFE_ID_REGEX = /^[a-zA-Z0-9._-]+$/;
 const HEX_64_REGEX = /^[a-f0-9]{64}$/i;
 const MAX_PAYLOAD_BYTES = 10 * 1024 * 1024; // 10 MB limit for serialized schedule
-const IF_NONE_MATCH_HEADERS = new Headers({ "If-None-Match": "*" });
+const IF_NONE_MATCH_COND = { etagDoesNotMatch: "*" };
 
-function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): Response {
+const NO_CACHE_JSON_HEADERS = {
+  "Content-Type": "application/json",
+  "Cache-Control": "no-cache",
+};
+
+function jsonResponse(data: unknown, status = 200, headers?: HeadersInit): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-cache",
-      ...headers,
-    },
+    headers: headers ? { ...NO_CACHE_JSON_HEADERS, ...headers } : NO_CACHE_JSON_HEADERS,
   });
 }
 
@@ -145,7 +146,7 @@ export async function handlePutAcceptedPayload(
 
   // Stream directly into R2.put with If-None-Match: *
   const putRes = await env.R2_BUCKET.put(payloadKey, request.body, {
-    onlyIf: IF_NONE_MATCH_HEADERS,
+    onlyIf: IF_NONE_MATCH_COND,
     httpMetadata: { contentType: "application/json" },
     customMetadata,
   });
@@ -404,7 +405,7 @@ export async function handlePutAccepted(
 
   // Initial pointer creation: use HTTP If-None-Match: *
   const putOptions: R2PutOptions = {
-    onlyIf: IF_NONE_MATCH_HEADERS,
+    onlyIf: IF_NONE_MATCH_COND,
     httpMetadata: { contentType: "application/json" },
   };
 
