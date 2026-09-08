@@ -1,7 +1,12 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { handleGetAccepted, handlePutAccepted } from "../worker/src/accepted-handler";
+import {
+  handleGetAccepted,
+  handleGetAcceptedPayload,
+  handlePutAccepted,
+  handlePutAcceptedPayload,
+} from "../worker/src/accepted-handler";
 import {
   extractOfficialPdfUrls,
   isAllowedPageApiUrl,
@@ -9,6 +14,7 @@ import {
 } from "../worker/src/extractor";
 import { generateSnapshotId, publishCandidateSnapshot } from "../worker/src/publisher";
 import type {
+  AcceptedPointer,
   AcceptedRecord,
   CurrentPointer,
   Env,
@@ -38,6 +44,21 @@ export class MockR2Bucket implements R2Bucket {
       customMetadata?: Record<string, string>;
     }
   >();
+
+  async head(key: string): Promise<R2Object | null> {
+    const item = this.storage.get(key);
+    if (!item) return null;
+    return {
+      key,
+      version: item.etag,
+      size: item.data.byteLength,
+      etag: item.etag,
+      httpEtag: item.httpEtag,
+      uploaded: item.uploaded,
+      httpMetadata: item.httpMetadata,
+      customMetadata: item.customMetadata,
+    };
+  }
 
   async get(key: string): Promise<R2ObjectBody | null> {
     const item = this.storage.get(key);
@@ -197,8 +218,9 @@ describe("worker transport & URL policy", () => {
 
   it("validates WordPress Page API URL", () => {
     expect(isAllowedPageApiUrl("https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view")).toBe(true);
-    expect(isAllowedPageApiUrl("https://utm.md/wp-json/wp/v2/pages")).toBe(true);
-    expect(isAllowedPageApiUrl("http://fcim.utm.md/wp-json/wp/v2/pages")).toBe(false);
+    expect(isAllowedPageApiUrl("https://utm.md/wp-json/wp/v2/pages")).toBe(false);
+    expect(isAllowedPageApiUrl("https://fcim.utm.md/wp-json/wp/v2/pages")).toBe(false);
+    expect(isAllowedPageApiUrl("http://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view")).toBe(false);
     expect(isAllowedPageApiUrl("https://malicious.com/wp-json")).toBe(false);
   });
 
@@ -442,21 +464,113 @@ describe("worker accepted-state gateway & CAS semantics", () => {
     schedule: sampleSchedule,
   };
 
-  it("rejects unauthorized PUT /accepted/course-1 without bearer secret", async () => {
+  const payloadSha = "1111111111111111111111111111111111111111111111111111111111111111";
+  const acceptedId1 = "a4c610d24dd53bbf-p1_3_0-1111111111111111";
+
+  const samplePointer: AcceptedPointer = {
+    schema_version: 1,
+    course_year: 1,
+    accepted_id: acceptedId1,
+    payload_key: `accepted-payloads/course-1/${acceptedId1}.json`,
+    payload_sha256: payloadSha,
+    source_snapshot_id: "snap-1",
+    source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
+    source_pdf_hash: "a4c610d24dd53bbf87c5da312ffebf7aabc112c7f28338587e18e1eb0526b79a",
+    parser_version: "1.3.0",
+    accepted_at: "2026-09-08T02:00:05.000Z",
+  };
+
+  it("rejects unauthorized PUT /accepted-payloads without bearer secret", async () => {
+    const bucket = new MockR2Bucket();
+    const env: Env = { R2_BUCKET: bucket, SCHEDULE_BROKER_SECRET: "correct-secret" };
+
+    const req = new Request(`https://broker.local/accepted-payloads/course-1/${acceptedId1}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sampleSchedule),
+    });
+
+    const res = await handlePutAcceptedPayload(req, env, "1", acceptedId1);
+    expect(res.status).toBe(401);
+  });
+
+  it("supports immutable payload upload and GET retrieval", async () => {
+    const bucket = new MockR2Bucket();
+    const env: Env = { R2_BUCKET: bucket, SCHEDULE_BROKER_SECRET: "secret" };
+
+    const req = new Request(`https://broker.local/accepted-payloads/course-1/${acceptedId1}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer secret",
+        "x-source-pdf-hash": samplePointer.source_pdf_hash,
+        "x-payload-sha256": samplePointer.payload_sha256,
+        "x-snapshot-id": samplePointer.source_snapshot_id,
+        "x-parser-version": samplePointer.parser_version,
+      },
+      body: JSON.stringify(sampleSchedule),
+    });
+
+    const res = await handlePutAcceptedPayload(req, env, "1", acceptedId1);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("created");
+
+    // Duplicate identical upload returns idempotent success
+    const dupReq = new Request(`https://broker.local/accepted-payloads/course-1/${acceptedId1}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer secret",
+        "x-source-pdf-hash": samplePointer.source_pdf_hash,
+        "x-payload-sha256": samplePointer.payload_sha256,
+        "x-snapshot-id": samplePointer.source_snapshot_id,
+        "x-parser-version": samplePointer.parser_version,
+      },
+      body: JSON.stringify(sampleSchedule),
+    });
+    const dupRes = await handlePutAcceptedPayload(dupReq, env, "1", acceptedId1);
+    expect(dupRes.status).toBe(200);
+    const dupBody = await dupRes.json();
+    expect(dupBody.status).toBe("idempotent");
+
+    // Conflicting metadata on existing key returns 409
+    const conflictReq = new Request(`https://broker.local/accepted-payloads/course-1/${acceptedId1}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer secret",
+        "x-source-pdf-hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "x-payload-sha256": samplePointer.payload_sha256,
+        "x-snapshot-id": samplePointer.source_snapshot_id,
+        "x-parser-version": samplePointer.parser_version,
+      },
+      body: JSON.stringify(sampleSchedule),
+    });
+    const conflictRes = await handlePutAcceptedPayload(conflictReq, env, "1", acceptedId1);
+    expect(conflictRes.status).toBe(409);
+
+    // GET payload returns streamed content
+    const getRes = await handleGetAcceptedPayload(env, "1", acceptedId1);
+    expect(getRes.status).toBe(200);
+    expect(getRes.headers.get("Cache-Control")).toContain("immutable");
+  });
+
+  it("rejects unauthorized PUT /accepted/course-1 pointer without bearer secret", async () => {
     const bucket = new MockR2Bucket();
     const env: Env = { R2_BUCKET: bucket, SCHEDULE_BROKER_SECRET: "correct-secret" };
 
     const req = new Request("https://broker.local/accepted/course-1", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expected_previous_hash: null, state: sampleAcceptedRecord }),
+      body: JSON.stringify({ expected_previous_accepted_id: null, pointer: samplePointer }),
     });
 
     const res = await handlePutAccepted(req, env, "1");
     expect(res.status).toBe(401);
   });
 
-  it("rejects accepted write when course_year does not match requested course", async () => {
+  it("rejects pointer write when course_year does not match requested course", async () => {
     const bucket = new MockR2Bucket();
     const env: Env = { R2_BUCKET: bucket, SCHEDULE_BROKER_SECRET: "secret" };
 
@@ -466,8 +580,8 @@ describe("worker accepted-state gateway & CAS semantics", () => {
         "Content-Type": "application/json",
         Authorization: "Bearer secret",
       },
-      // Course 1 state offered to Course 2 endpoint
-      body: JSON.stringify({ expected_previous_hash: null, state: sampleAcceptedRecord }),
+      // Course 1 pointer offered to Course 2 endpoint
+      body: JSON.stringify({ expected_previous_accepted_id: null, pointer: samplePointer }),
     });
 
     const res = await handlePutAccepted(req, env, "2");
@@ -476,7 +590,7 @@ describe("worker accepted-state gateway & CAS semantics", () => {
     expect(body.error).toContain("does not match requested course 2");
   });
 
-  it("supports initial accepted-state PUT with expected_previous_hash null", async () => {
+  it("rejects pointer write when referenced payload does not exist in storage", async () => {
     const bucket = new MockR2Bucket();
     const env: Env = { R2_BUCKET: bucket, SCHEDULE_BROKER_SECRET: "secret" };
 
@@ -486,7 +600,38 @@ describe("worker accepted-state gateway & CAS semantics", () => {
         "Content-Type": "application/json",
         Authorization: "Bearer secret",
       },
-      body: JSON.stringify({ expected_previous_hash: null, state: sampleAcceptedRecord }),
+      body: JSON.stringify({ expected_previous_accepted_id: null, pointer: samplePointer }),
+    });
+
+    const res = await handlePutAccepted(req, env, "1");
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("does not exist in storage");
+  });
+
+  it("supports initial accepted pointer PUT and GET when payload exists", async () => {
+    const bucket = new MockR2Bucket();
+    const env: Env = { R2_BUCKET: bucket, SCHEDULE_BROKER_SECRET: "secret" };
+
+    // 1. Upload payload first
+    await bucket.put(samplePointer.payload_key, JSON.stringify(sampleSchedule), {
+      customMetadata: {
+        course_year: "1",
+        source_pdf_hash: samplePointer.source_pdf_hash,
+        payload_sha256: samplePointer.payload_sha256,
+        snapshot_id: samplePointer.source_snapshot_id,
+        parser_version: samplePointer.parser_version,
+      },
+    });
+
+    // 2. Put pointer with expected_previous_accepted_id: null
+    const req = new Request("https://broker.local/accepted/course-1", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer secret",
+      },
+      body: JSON.stringify({ expected_previous_accepted_id: null, pointer: samplePointer }),
     });
 
     const res = await handlePutAccepted(req, env, "1");
@@ -494,36 +639,47 @@ describe("worker accepted-state gateway & CAS semantics", () => {
     const body = await res.json();
     expect(body.status).toBe("created");
 
-    // Verify GET /accepted/course-1 returns the stored accepted state
+    // 3. GET /accepted/course-1 returns stored pointer
     const getRes = await handleGetAccepted(env, "1");
     expect(getRes.status).toBe(200);
-    const fetched = (await getRes.json()) as AcceptedRecord;
-    expect(fetched.source_pdf_hash).toBe(sampleAcceptedRecord.source_pdf_hash);
+    const fetched = (await getRes.json()) as AcceptedPointer;
+    expect(fetched.accepted_id).toBe(samplePointer.accepted_id);
+    expect(fetched.payload_key).toBe(samplePointer.payload_key);
   });
 
-  it("handles idempotent PUT when state is re-submitted with identical hash", async () => {
+  it("handles idempotent pointer PUT when re-submitted with identical accepted_id", async () => {
     const bucket = new MockR2Bucket();
     const env: Env = { R2_BUCKET: bucket, SCHEDULE_BROKER_SECRET: "secret" };
 
-    // Initial write
+    await bucket.put(samplePointer.payload_key, JSON.stringify(sampleSchedule), {
+      customMetadata: {
+        course_year: "1",
+        source_pdf_hash: samplePointer.source_pdf_hash,
+        payload_sha256: samplePointer.payload_sha256,
+        snapshot_id: samplePointer.source_snapshot_id,
+        parser_version: samplePointer.parser_version,
+      },
+    });
+
+    // Initial pointer write
     await handlePutAccepted(
       new Request("https://broker.local/accepted/course-1", {
         method: "PUT",
         headers: { "Content-Type": "application/json", Authorization: "Bearer secret" },
-        body: JSON.stringify({ expected_previous_hash: null, state: sampleAcceptedRecord }),
+        body: JSON.stringify({ expected_previous_accepted_id: null, pointer: samplePointer }),
       }),
       env,
       "1",
     );
 
-    // Duplicate submission with same hash
+    // Duplicate submission with same accepted_id
     const dupRes = await handlePutAccepted(
       new Request("https://broker.local/accepted/course-1", {
         method: "PUT",
         headers: { "Content-Type": "application/json", Authorization: "Bearer secret" },
         body: JSON.stringify({
-          expected_previous_hash: sampleAcceptedRecord.source_pdf_hash,
-          state: sampleAcceptedRecord,
+          expected_previous_accepted_id: samplePointer.accepted_id,
+          pointer: samplePointer,
         }),
       }),
       env,
@@ -535,37 +691,60 @@ describe("worker accepted-state gateway & CAS semantics", () => {
     expect(body.status).toBe("idempotent");
   });
 
-  it("rejects stale PUT with 409 conflict when existing hash does not match expected_previous_hash", async () => {
+  it("rejects stale pointer PUT with 409 conflict when existing accepted_id differs from expected", async () => {
     const bucket = new MockR2Bucket();
     const env: Env = { R2_BUCKET: bucket, SCHEDULE_BROKER_SECRET: "secret" };
+
+    await bucket.put(samplePointer.payload_key, JSON.stringify(sampleSchedule), {
+      customMetadata: {
+        course_year: "1",
+        source_pdf_hash: samplePointer.source_pdf_hash,
+        payload_sha256: samplePointer.payload_sha256,
+        snapshot_id: samplePointer.source_snapshot_id,
+        parser_version: samplePointer.parser_version,
+      },
+    });
 
     // Initial write
     await handlePutAccepted(
       new Request("https://broker.local/accepted/course-1", {
         method: "PUT",
         headers: { "Content-Type": "application/json", Authorization: "Bearer secret" },
-        body: JSON.stringify({ expected_previous_hash: null, state: sampleAcceptedRecord }),
+        body: JSON.stringify({ expected_previous_accepted_id: null, pointer: samplePointer }),
       }),
       env,
       "1",
     );
 
-    // Newer state
-    const updatedRecord: AcceptedRecord = {
-      ...sampleAcceptedRecord,
-      snapshot_id: "snap-2",
+    // Newer pointer and payload
+    const acceptedId2 = "b5d721e35ee64ccf-p1_3_0-2222222222222222";
+    const updatedPointer: AcceptedPointer = {
+      ...samplePointer,
+      accepted_id: acceptedId2,
+      payload_key: `accepted-payloads/course-1/${acceptedId2}.json`,
+      payload_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
       source_pdf_hash: "b5d721e35ee64ccf98d6eb42300ffc8abb223d8a394496988f29f2fc1637c80b",
-      accepted_at: "2026-09-08T03:00:00.000Z",
+      source_snapshot_id: "snap-2",
     };
 
-    // Stale writer expects null (initial) or a different hash
+    await bucket.put(updatedPointer.payload_key, JSON.stringify(sampleSchedule), {
+      customMetadata: {
+        course_year: "1",
+        source_pdf_hash: updatedPointer.source_pdf_hash,
+        payload_sha256: updatedPointer.payload_sha256,
+        snapshot_id: updatedPointer.source_snapshot_id,
+        parser_version: updatedPointer.parser_version,
+      },
+    });
+
+    // Stale writer expects wrong previous ID
     const staleRes = await handlePutAccepted(
       new Request("https://broker.local/accepted/course-1", {
         method: "PUT",
         headers: { "Content-Type": "application/json", Authorization: "Bearer secret" },
         body: JSON.stringify({
-          expected_previous_hash: "wrong_previous_hash_00000000000000000000000000000000000000000000000000",
-          state: updatedRecord,
+          expected_previous_accepted_id: "wrong_previous_id",
+          pointer: updatedPointer,
         }),
       }),
       env,
@@ -577,36 +756,59 @@ describe("worker accepted-state gateway & CAS semantics", () => {
     expect(body.error).toContain("Conflict");
   });
 
-  it("updates accepted state with 200 when expected_previous_hash matches", async () => {
+  it("updates accepted pointer with 200 when expected_previous_accepted_id matches", async () => {
     const bucket = new MockR2Bucket();
     const env: Env = { R2_BUCKET: bucket, SCHEDULE_BROKER_SECRET: "secret" };
 
-    // Initial write (hash A)
+    await bucket.put(samplePointer.payload_key, JSON.stringify(sampleSchedule), {
+      customMetadata: {
+        course_year: "1",
+        source_pdf_hash: samplePointer.source_pdf_hash,
+        payload_sha256: samplePointer.payload_sha256,
+        snapshot_id: samplePointer.source_snapshot_id,
+        parser_version: samplePointer.parser_version,
+      },
+    });
+
+    // Initial write
     await handlePutAccepted(
       new Request("https://broker.local/accepted/course-1", {
         method: "PUT",
         headers: { "Content-Type": "application/json", Authorization: "Bearer secret" },
-        body: JSON.stringify({ expected_previous_hash: null, state: sampleAcceptedRecord }),
+        body: JSON.stringify({ expected_previous_accepted_id: null, pointer: samplePointer }),
       }),
       env,
       "1",
     );
 
-    // Update to hash B with expected_previous_hash = hash A
-    const updatedRecord: AcceptedRecord = {
-      ...sampleAcceptedRecord,
-      snapshot_id: "snap-2",
+    // Update with valid payload and matching expected_previous_accepted_id
+    const acceptedId2 = "b5d721e35ee64ccf-p1_3_0-2222222222222222";
+    const updatedPointer: AcceptedPointer = {
+      ...samplePointer,
+      accepted_id: acceptedId2,
+      payload_key: `accepted-payloads/course-1/${acceptedId2}.json`,
+      payload_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
       source_pdf_hash: "b5d721e35ee64ccf98d6eb42300ffc8abb223d8a394496988f29f2fc1637c80b",
-      accepted_at: "2026-09-08T03:00:00.000Z",
+      source_snapshot_id: "snap-2",
     };
+
+    await bucket.put(updatedPointer.payload_key, JSON.stringify(sampleSchedule), {
+      customMetadata: {
+        course_year: "1",
+        source_pdf_hash: updatedPointer.source_pdf_hash,
+        payload_sha256: updatedPointer.payload_sha256,
+        snapshot_id: updatedPointer.source_snapshot_id,
+        parser_version: updatedPointer.parser_version,
+      },
+    });
 
     const updateRes = await handlePutAccepted(
       new Request("https://broker.local/accepted/course-1", {
         method: "PUT",
         headers: { "Content-Type": "application/json", Authorization: "Bearer secret" },
         body: JSON.stringify({
-          expected_previous_hash: sampleAcceptedRecord.source_pdf_hash,
-          state: updatedRecord,
+          expected_previous_accepted_id: samplePointer.accepted_id,
+          pointer: updatedPointer,
         }),
       }),
       env,
@@ -618,7 +820,7 @@ describe("worker accepted-state gateway & CAS semantics", () => {
     expect(body.status).toBe("updated");
 
     const getRes = await handleGetAccepted(env, "1");
-    const fetched = (await getRes.json()) as AcceptedRecord;
-    expect(fetched.source_pdf_hash).toBe(updatedRecord.source_pdf_hash);
+    const fetched = (await getRes.json()) as AcceptedPointer;
+    expect(fetched.accepted_id).toBe(updatedPointer.accepted_id);
   });
 });

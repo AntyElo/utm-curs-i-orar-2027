@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { config } from "@/lib/config";
-import type { AcceptedRecord, CurrentPointer, Schedule, SnapshotManifest } from "@/lib/models";
+import type { AcceptedPointer, CurrentPointer, Schedule, SnapshotManifest } from "@/lib/models";
 import { parsePdf, sha256 } from "@/lib/parser";
 import {
   bootstrapScheduleState,
@@ -26,7 +26,6 @@ describe("accepted-state synchronization & transaction ordering", () => {
 
   beforeEach(async () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "fcim-sync-test-"));
-    // Override dataDir for tests
     (config as { dataDir: string }).dataDir = tempDir;
     (config as { brokerUrl: string }).brokerUrl = "https://broker.fcim.internal";
     (config as { brokerSecret: string }).brokerSecret = "broker-test-secret";
@@ -50,6 +49,15 @@ describe("accepted-state synchronization & transaction ordering", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
+  function decodeBody(body: unknown): string {
+    if (!body) return "";
+    if (typeof body === "string") return body;
+    if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
+      return new TextDecoder().decode(body);
+    }
+    return String(body);
+  }
+
   function pdfResponse(bytes: Uint8Array): Response {
     return new Response(Buffer.from(bytes), {
       status: 200,
@@ -57,40 +65,101 @@ describe("accepted-state synchronization & transaction ordering", () => {
     });
   }
 
-  async function makeSchedule(bytes: Uint8Array, url: string, courseYear = 1, parserVersion: string = config.parserVersion): Promise<Schedule> {
+  async function makeSchedule(
+    bytes: Uint8Array,
+    url: string,
+    courseYear = 1,
+    parserVersion: string = config.parserVersion,
+    snapshotId = "snap-test",
+  ): Promise<Schedule> {
     const { schedule } = await parsePdf(bytes, {
       source_page_url: "https://fcim.utm.md/procesul-de-studii/orar/",
       source_pdf_url: url,
       source_kind: "live",
       source_transport: "broker",
-      source_snapshot_id: "snap-test",
+      source_snapshot_id: snapshotId,
       downloaded_at: "2026-09-08T02:00:00.000Z",
       course_year: courseYear,
     });
     schedule.metadata.parser_version = parserVersion;
+    schedule.metadata.source_transport = "broker";
+    schedule.metadata.source_snapshot_id = snapshotId;
     return schedule;
+  }
+
+  function makeAcceptedMock(
+    courseYear: number,
+    schedule: Schedule,
+    snapshotId = "snap-test",
+    acceptedAt = "2026-09-08T02:00:00.000Z",
+  ) {
+    schedule.metadata.source_snapshot_id = snapshotId;
+    schedule.metadata.source_transport = "broker";
+    const payloadBytes = new TextEncoder().encode(JSON.stringify(schedule));
+    const payloadSha256 = sha256(payloadBytes);
+    const parserVersion = schedule.metadata.parser_version || config.parserVersion;
+    const acceptedId = `${schedule.metadata.source_pdf_hash.slice(0, 16)}-p${parserVersion.replace(/\./g, "_")}-${payloadSha256.slice(0, 16)}`;
+
+    const pointer: AcceptedPointer = {
+      schema_version: 1,
+      course_year: courseYear,
+      accepted_id: acceptedId,
+      payload_key: `accepted-payloads/course-${courseYear}/${acceptedId}.json`,
+      payload_sha256: payloadSha256,
+      source_snapshot_id: snapshotId,
+      source_pdf_url: schedule.metadata.source_pdf_url,
+      source_pdf_hash: schedule.metadata.source_pdf_hash,
+      parser_version: parserVersion,
+      accepted_at: acceptedAt,
+    };
+
+    return { pointer, schedule, payloadBytes, acceptedId };
+  }
+
+  function makePageApiPayload(links: Array<{ courseYear: number; url: string }>) {
+    const romanMap: Record<number, string> = { 1: "I", 2: "II", 3: "III", 4: "IV" };
+    const cells = links
+      .map((l) => `<td><a href="${l.url}">Anul ${romanMap[l.courseYear] ?? l.courseYear}</a></td>`)
+      .join("\n");
+    return [
+      {
+        id: 1739,
+        date_gmt: "2026-09-08T02:00:00",
+        content: {
+          rendered: `
+            <section>
+              <h2>Ciclul I, Licență - învățământ cu frecvență</h2>
+              <table>
+                <tr>
+                  <td>Orarul semestrul de toamna 2026/2027</td>
+                  ${cells}
+                </tr>
+              </table>
+            </section>
+          `,
+        },
+      },
+    ];
   }
 
   it("restores accepted schedule during cold-start bootstrap before candidate validation", async () => {
     const schedule = await makeSchedule(
       pdfBytes18,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
+      1,
+      config.parserVersion,
+      "snap-bootstrap",
     );
 
-    const brokerAcceptedRecord: AcceptedRecord = {
-      schema_version: 1,
-      course_year: 1,
-      snapshot_id: "snap-bootstrap",
-      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
-      source_pdf_hash: hash18,
-      accepted_at: "2026-09-08T02:00:00.000Z",
-      schedule,
-    };
+    const mockC1 = makeAcceptedMock(1, schedule, "snap-bootstrap");
 
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const urlStr = String(input);
       if (urlStr.includes("/accepted/course-1")) {
-        return new Response(JSON.stringify(brokerAcceptedRecord), { status: 200 });
+        return new Response(JSON.stringify(mockC1.pointer), { status: 200 });
+      }
+      if (urlStr.includes(`/accepted-payloads/course-1/${mockC1.acceptedId}`)) {
+        return new Response(JSON.stringify(mockC1.schedule), { status: 200 });
       }
       if (urlStr.includes("/accepted/course-2")) {
         return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
@@ -98,12 +167,10 @@ describe("accepted-state synchronization & transaction ordering", () => {
       return new Response("not found", { status: 404 });
     }) as typeof fetch;
 
-    // Verify local storage is empty initially
     expect(await getCurrentSchedule(1)).toBeNull();
 
     await bootstrapScheduleState();
 
-    // Verify course 1 was restored exactly
     const local = await getCurrentSchedule(1);
     expect(local).not.toBeNull();
     expect(local?.metadata.source_pdf_hash).toBe(hash18);
@@ -122,49 +189,40 @@ describe("accepted-state synchronization & transaction ordering", () => {
     );
 
     // Corrupted record offering course 1 schedule for course 2
-    const corruptedRecord: AcceptedRecord = {
-      schema_version: 1,
-      course_year: 2,
-      snapshot_id: "snap-wrong",
-      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
-      source_pdf_hash: hash18,
-      accepted_at: "2026-09-08T02:00:00.000Z",
-      schedule: {
-        ...schedule,
-        metadata: {
-          ...schedule.metadata,
-          course_year: 1, // Course year mismatch with record.course_year
-        },
-      },
-    };
+    const corruptedMock = makeAcceptedMock(2, schedule, "snap-wrong");
+    // Force pointer course_year to 2 while schedule has 1
+    corruptedMock.pointer.course_year = 2;
 
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const urlStr = String(input);
       if (urlStr.includes("/accepted/course-2")) {
-        return new Response(JSON.stringify(corruptedRecord), { status: 200 });
+        return new Response(JSON.stringify(corruptedMock.pointer), { status: 200 });
+      }
+      if (urlStr.includes(`/accepted-payloads/course-2/${corruptedMock.acceptedId}`)) {
+        return new Response(JSON.stringify(corruptedMock.schedule), { status: 200 });
       }
       return new Response("not found", { status: 404 });
     }) as typeof fetch;
 
     await bootstrapScheduleState();
 
-    // Course 2 should NOT have installed the wrong course record
     const localCourse2 = await getCurrentSchedule(2);
-    // Either bundled seed for course 2 or null, but never the course 1 schedule!
     if (localCourse2) {
       expect(localCourse2.metadata.course_year).toBe(2);
     }
   });
 
   it("maintains previous local schedule when durable write fails (transaction ordering)", async () => {
-    // Initial local known-good schedule (r9)
     const initialSchedule = await makeSchedule(
       pdfBytes9,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
+      1,
+      config.parserVersion,
+      "snap-r9",
     );
     await replaceCurrentSchedule(1, initialSchedule);
+    const mockR9 = makeAcceptedMock(1, initialSchedule, "snap-r9");
 
-    // Mock broker candidate pointing to r18
     const candidatePointer: CurrentPointer = {
       schema_version: 1,
       snapshot_id: "snap-r18",
@@ -198,7 +256,10 @@ describe("accepted-state synchronization & transaction ordering", () => {
       ],
     };
 
-    // Broker fails on PUT /accepted/course-1 with 500 error
+    const pageApiPayload = makePageApiPayload([
+      { courseYear: 1, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf" },
+    ]);
+
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const urlStr = String(input);
       const method = init?.method?.toUpperCase() ?? "GET";
@@ -209,27 +270,26 @@ describe("accepted-state synchronization & transaction ordering", () => {
       if (urlStr.includes("/manifest.json")) {
         return new Response(JSON.stringify(candidateManifest), { status: 200 });
       }
+      if (urlStr.includes("/page-api.json")) {
+        return new Response(JSON.stringify(pageApiPayload), { status: 200 });
+      }
       if (urlStr.endsWith(".pdf")) {
         return pdfResponse(pdfBytes18);
       }
       if (urlStr.includes("/accepted/course-1")) {
         if (method === "GET") {
-          return new Response(
-            JSON.stringify({
-              schema_version: 1,
-              course_year: 1,
-              snapshot_id: "snap-r9",
-              source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
-              source_pdf_hash: hash9,
-              accepted_at: "2026-09-08T02:00:00.000Z",
-              schedule: initialSchedule,
-            }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify(mockR9.pointer), { status: 200 });
         }
         if (method === "PUT") {
-          // Durable write FAILS!
           return new Response(JSON.stringify({ error: "R2 storage down" }), { status: 500 });
+        }
+      }
+      if (urlStr.includes(`/accepted-payloads/course-1/${mockR9.acceptedId}`)) {
+        return new Response(JSON.stringify(mockR9.schedule), { status: 200 });
+      }
+      if (urlStr.includes("/accepted-payloads/course-1")) {
+        if (method === "PUT") {
+          return new Response(JSON.stringify({ ok: true, status: "created" }), { status: 200 });
         }
       }
       return new Response("not found", { status: 404 });
@@ -239,18 +299,20 @@ describe("accepted-state synchronization & transaction ordering", () => {
     expect(result.outcome).toBe("error");
     expect(result.message).toContain("Durable accepted write failed");
 
-    // Local schedule MUST remain r9! Not r18!
     const localAfter = await getCurrentSchedule(1);
     expect(localAfter?.metadata.source_pdf_hash).toBe(hash9);
   });
 
   it("installs candidate locally only after durable write succeeds", async () => {
-    // Initial local known-good schedule (r9)
     const initialSchedule = await makeSchedule(
       pdfBytes9,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
+      1,
+      config.parserVersion,
+      "snap-r9",
     );
     await replaceCurrentSchedule(1, initialSchedule);
+    const mockR9 = makeAcceptedMock(1, initialSchedule, "snap-r9");
 
     let durableWriteExecuted = false;
 
@@ -287,6 +349,10 @@ describe("accepted-state synchronization & transaction ordering", () => {
       ],
     };
 
+    const pageApiPayload = makePageApiPayload([
+      { courseYear: 1, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf" },
+    ]);
+
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const urlStr = String(input);
       const method = init?.method?.toUpperCase() ?? "GET";
@@ -297,27 +363,27 @@ describe("accepted-state synchronization & transaction ordering", () => {
       if (urlStr.includes("/manifest.json")) {
         return new Response(JSON.stringify(candidateManifest), { status: 200 });
       }
+      if (urlStr.includes("/page-api.json")) {
+        return new Response(JSON.stringify(pageApiPayload), { status: 200 });
+      }
       if (urlStr.endsWith(".pdf")) {
         return pdfResponse(pdfBytes18);
       }
       if (urlStr.includes("/accepted/course-1")) {
         if (method === "GET") {
-          return new Response(
-            JSON.stringify({
-              schema_version: 1,
-              course_year: 1,
-              snapshot_id: "snap-r9",
-              source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
-              source_pdf_hash: hash9,
-              accepted_at: "2026-09-08T02:00:00.000Z",
-              schedule: initialSchedule,
-            }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify(mockR9.pointer), { status: 200 });
         }
         if (method === "PUT") {
           durableWriteExecuted = true;
           return new Response(JSON.stringify({ ok: true, status: "updated" }), { status: 200 });
+        }
+      }
+      if (urlStr.includes(`/accepted-payloads/course-1/${mockR9.acceptedId}`)) {
+        return new Response(JSON.stringify(mockR9.schedule), { status: 200 });
+      }
+      if (urlStr.includes("/accepted-payloads/course-1")) {
+        if (method === "PUT") {
+          return new Response(JSON.stringify({ ok: true, status: "created" }), { status: 200 });
         }
       }
       return new Response("not found", { status: 404 });
@@ -332,16 +398,21 @@ describe("accepted-state synchronization & transaction ordering", () => {
   });
 
   it("reconciles durable state if local state is missing or stale before candidate evaluation", async () => {
-    // Durable state in broker is r18
     const r18Schedule = await makeSchedule(
       pdfBytes18,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
+      1,
+      config.parserVersion,
+      "snap-r18",
     );
+    const mockR18 = makeAcceptedMock(1, r18Schedule, "snap-r18");
 
-    // But local state is stale (r9)
     const r9Schedule = await makeSchedule(
       pdfBytes9,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
+      1,
+      config.parserVersion,
+      "snap-r9",
     );
     await replaceCurrentSchedule(1, r9Schedule);
 
@@ -378,6 +449,10 @@ describe("accepted-state synchronization & transaction ordering", () => {
       ],
     };
 
+    const pageApiPayload = makePageApiPayload([
+      { courseYear: 1, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf" },
+    ]);
+
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const urlStr = String(input);
       if (urlStr.endsWith("/current")) {
@@ -386,22 +461,17 @@ describe("accepted-state synchronization & transaction ordering", () => {
       if (urlStr.includes("/manifest.json")) {
         return new Response(JSON.stringify(candidateManifest), { status: 200 });
       }
+      if (urlStr.includes("/page-api.json")) {
+        return new Response(JSON.stringify(pageApiPayload), { status: 200 });
+      }
       if (urlStr.endsWith(".pdf")) {
         return pdfResponse(pdfBytes18);
       }
       if (urlStr.includes("/accepted/course-1")) {
-        return new Response(
-          JSON.stringify({
-            schema_version: 1,
-            course_year: 1,
-            snapshot_id: "snap-r18",
-            source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
-            source_pdf_hash: hash18,
-            accepted_at: "2026-09-08T02:10:00.000Z",
-            schedule: r18Schedule,
-          }),
-          { status: 200 },
-        );
+        return new Response(JSON.stringify(mockR18.pointer), { status: 200 });
+      }
+      if (urlStr.includes(`/accepted-payloads/course-1/${mockR18.acceptedId}`)) {
+        return new Response(JSON.stringify(mockR18.schedule), { status: 200 });
       }
       return new Response("not found", { status: 404 });
     }) as typeof fetch;
@@ -409,20 +479,20 @@ describe("accepted-state synchronization & transaction ordering", () => {
     const result = await checkForUpdates(1);
     expect(result.outcome).toBe("unchanged");
 
-    // Local schedule has been reconciled to r18
     const local = await getCurrentSchedule(1);
     expect(local?.metadata.source_pdf_hash).toBe(hash18);
   });
 
   it("re-parses cached PDF when parser version is stale even if PDF is unchanged", async () => {
-    // Current schedule parsed by older parser 1.0.0
     const olderSchedule = await makeSchedule(
       pdfBytes18,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
       1,
       "1.0.0",
+      "snap-r18",
     );
     await replaceCurrentSchedule(1, olderSchedule);
+    const mockOlder = makeAcceptedMock(1, olderSchedule, "snap-r18");
 
     let durableWriteExecuted = false;
 
@@ -459,6 +529,10 @@ describe("accepted-state synchronization & transaction ordering", () => {
       ],
     };
 
+    const pageApiPayload = makePageApiPayload([
+      { courseYear: 1, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf" },
+    ]);
+
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const urlStr = String(input);
       const method = init?.method?.toUpperCase() ?? "GET";
@@ -469,27 +543,27 @@ describe("accepted-state synchronization & transaction ordering", () => {
       if (urlStr.includes("/manifest.json")) {
         return new Response(JSON.stringify(candidateManifest), { status: 200 });
       }
+      if (urlStr.includes("/page-api.json")) {
+        return new Response(JSON.stringify(pageApiPayload), { status: 200 });
+      }
       if (urlStr.endsWith(".pdf")) {
         return pdfResponse(pdfBytes18);
       }
       if (urlStr.includes("/accepted/course-1")) {
         if (method === "GET") {
-          return new Response(
-            JSON.stringify({
-              schema_version: 1,
-              course_year: 1,
-              snapshot_id: "snap-r18",
-              source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
-              source_pdf_hash: hash18,
-              accepted_at: "2026-09-08T02:00:00.000Z",
-              schedule: olderSchedule,
-            }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify(mockOlder.pointer), { status: 200 });
         }
         if (method === "PUT") {
           durableWriteExecuted = true;
-          return new Response(JSON.stringify({ ok: true, status: "idempotent" }), { status: 200 });
+          return new Response(JSON.stringify({ ok: true, status: "updated" }), { status: 200 });
+        }
+      }
+      if (urlStr.includes(`/accepted-payloads/course-1/${mockOlder.acceptedId}`)) {
+        return new Response(JSON.stringify(mockOlder.schedule), { status: 200 });
+      }
+      if (urlStr.includes("/accepted-payloads/course-1")) {
+        if (method === "PUT") {
+          return new Response(JSON.stringify({ ok: true, status: "created" }), { status: 200 });
         }
       }
       return new Response("not found", { status: 404 });
@@ -504,13 +578,15 @@ describe("accepted-state synchronization & transaction ordering", () => {
   });
 
   it("maintains per-course independence during refresh: course 1 succeeds, course 2 stays unchanged on error", async () => {
-    // Course 1 and Course 2 both have initial valid schedules
     const course1Initial = await makeSchedule(
       pdfBytes9,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
       1,
+      config.parserVersion,
+      "snap-c1",
     );
     await replaceCurrentSchedule(1, course1Initial);
+    const mockC1 = makeAcceptedMock(1, course1Initial, "snap-c1");
 
     const seed11Path = path.join(__dirname, "..", "data", "seed", "anul_ii_semestrul_iii-11.pdf");
     const pdfBytes11 = new Uint8Array(await readFile(seed11Path));
@@ -518,8 +594,11 @@ describe("accepted-state synchronization & transaction ordering", () => {
       pdfBytes11,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-11.pdf",
       2,
+      config.parserVersion,
+      "snap-c2",
     );
     await replaceCurrentSchedule(2, course2Initial);
+    const mockC2 = makeAcceptedMock(2, course2Initial, "snap-c2");
 
     const candidatePointer: CurrentPointer = {
       schema_version: 1,
@@ -528,7 +607,6 @@ describe("accepted-state synchronization & transaction ordering", () => {
       manifest_r2_key: "snapshots/snap-mixed/manifest.json",
     };
 
-    // Candidate manifest has updated PDF for Course 1 (r18), but invalid/failing candidate for Course 2
     const candidateManifest: SnapshotManifest = {
       schema_version: 1,
       snapshot_id: "snap-mixed",
@@ -564,6 +642,11 @@ describe("accepted-state synchronization & transaction ordering", () => {
       ],
     };
 
+    const pageApiPayload = makePageApiPayload([
+      { courseYear: 1, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf" },
+      { courseYear: 2, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-99.pdf" },
+    ]);
+
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const urlStr = String(input);
       const method = init?.method?.toUpperCase() ?? "GET";
@@ -574,45 +657,36 @@ describe("accepted-state synchronization & transaction ordering", () => {
       if (urlStr.includes("/manifest.json")) {
         return new Response(JSON.stringify(candidateManifest), { status: 200 });
       }
+      if (urlStr.includes("/page-api.json")) {
+        return new Response(JSON.stringify(pageApiPayload), { status: 200 });
+      }
       if (urlStr.includes("anul_i_semestrul_i-18.pdf")) {
         return pdfResponse(pdfBytes18);
       }
       if (urlStr.includes("anul_ii_semestrul_iii-99.pdf")) {
-        // Corrupted file for course 2!
         return pdfResponse(new TextEncoder().encode("%PDF-1.4 Not a timetable"));
       }
       if (urlStr.includes("/accepted/course-1")) {
         if (method === "GET") {
-          return new Response(
-            JSON.stringify({
-              schema_version: 1,
-              course_year: 1,
-              snapshot_id: "snap-c1",
-              source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
-              source_pdf_hash: hash9,
-              accepted_at: "2026-09-08T02:00:00.000Z",
-              schedule: course1Initial,
-            }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify(mockC1.pointer), { status: 200 });
         }
         if (method === "PUT") {
           return new Response(JSON.stringify({ ok: true, status: "updated" }), { status: 200 });
         }
       }
+      if (urlStr.includes(`/accepted-payloads/course-1/${mockC1.acceptedId}`)) {
+        return new Response(JSON.stringify(mockC1.schedule), { status: 200 });
+      }
+      if (urlStr.includes("/accepted-payloads/course-1")) {
+        if (method === "PUT") {
+          return new Response(JSON.stringify({ ok: true, status: "created" }), { status: 200 });
+        }
+      }
       if (urlStr.includes("/accepted/course-2")) {
-        return new Response(
-          JSON.stringify({
-            schema_version: 1,
-            course_year: 2,
-            snapshot_id: "snap-c2",
-            source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_ii_semestrul_iii-11.pdf",
-            source_pdf_hash: sha256(pdfBytes11),
-            accepted_at: "2026-09-08T02:00:00.000Z",
-            schedule: course2Initial,
-          }),
-          { status: 200 },
-        );
+        return new Response(JSON.stringify(mockC2.pointer), { status: 200 });
+      }
+      if (urlStr.includes(`/accepted-payloads/course-2/${mockC2.acceptedId}`)) {
+        return new Response(JSON.stringify(mockC2.schedule), { status: 200 });
       }
       return new Response("not found", { status: 404 });
     }) as typeof fetch;
@@ -624,35 +698,27 @@ describe("accepted-state synchronization & transaction ordering", () => {
     expect(c1Result?.outcome).toBe("updated");
     expect(c2Result?.outcome).toBe("rejected");
 
-    // Course 1 was updated to r18
     expect((await getCurrentSchedule(1))?.metadata.source_pdf_hash).toBe(hash18);
-    // Course 2 was NOT touched, still holds initial schedule
     expect((await getCurrentSchedule(2))?.metadata.source_pdf_hash).toBe(sha256(pdfBytes11));
   });
 
   it("end-to-end contract: r18 accepted -> r19 valid -> r20 bad rejected -> wipe local -> r19 baseline restored -> r20 rejected again", async () => {
-    // Stage 1: r18 durable accepted and installed
     const r18Schedule = await makeSchedule(
       pdfBytes18,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
+      1,
+      config.parserVersion,
+      "snap-r18",
     );
     await replaceCurrentSchedule(1, r18Schedule);
+    let activeMock = makeAcceptedMock(1, r18Schedule, "snap-r18");
 
-    let brokerDurableState: AcceptedRecord = {
-      schema_version: 1,
-      course_year: 1,
-      snapshot_id: "snap-r18",
-      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
-      source_pdf_hash: hash18,
-      accepted_at: "2026-09-08T02:00:00.000Z",
-      schedule: r18Schedule,
-    };
-
-    // Stage 2: r19 valid candidate published
-    // We create r19 as a valid schedule from pdfBytes9
     const r19Schedule = await makeSchedule(
       pdfBytes9,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
+      1,
+      config.parserVersion,
+      "snap-r19",
     );
 
     let currentPointer: CurrentPointer = {
@@ -688,6 +754,12 @@ describe("accepted-state synchronization & transaction ordering", () => {
       ],
     };
 
+    let activePageApi = makePageApiPayload([
+      { courseYear: 1, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf" },
+    ]);
+    let activePointer = activeMock.pointer;
+    const payloads = new Map<string, Schedule>();
+    payloads.set(activePointer.accepted_id, activeMock.schedule);
     let activePdfBytes = pdfBytes9;
 
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -700,35 +772,50 @@ describe("accepted-state synchronization & transaction ordering", () => {
       if (urlStr.includes("/manifest.json")) {
         return new Response(JSON.stringify(currentManifest), { status: 200 });
       }
+      if (urlStr.includes("/page-api.json")) {
+        return new Response(JSON.stringify(activePageApi), { status: 200 });
+      }
       if (urlStr.endsWith(".pdf")) {
         return pdfResponse(activePdfBytes);
       }
       if (urlStr.includes("/accepted/course-1")) {
         if (method === "GET") {
-          return new Response(JSON.stringify(brokerDurableState), { status: 200 });
+          return new Response(JSON.stringify(activePointer), { status: 200 });
         }
         if (method === "PUT") {
-          const body = JSON.parse(String(init?.body)) as {
-            expected_previous_hash: string | null;
-            state: AcceptedRecord;
+          const body = JSON.parse(decodeBody(init?.body)) as {
+            expected_previous_accepted_id: string | null;
+            pointer: AcceptedPointer;
           };
-          if (body.expected_previous_hash !== brokerDurableState.source_pdf_hash) {
+          if (body.expected_previous_accepted_id !== activePointer.accepted_id) {
             return new Response(JSON.stringify({ error: "CAS conflict" }), { status: 409 });
           }
-          brokerDurableState = body.state;
+          activePointer = body.pointer;
           return new Response(JSON.stringify({ ok: true, status: "updated" }), { status: 200 });
+        }
+      }
+      if (urlStr.includes("/accepted-payloads/course-1/")) {
+        const id = urlStr.split("/accepted-payloads/course-1/")[1];
+        if (method === "GET") {
+          const sched = payloads.get(id);
+          if (sched) return new Response(JSON.stringify(sched), { status: 200 });
+          return new Response("not found", { status: 404 });
+        }
+        if (method === "PUT") {
+          const sched = JSON.parse(decodeBody(init?.body)) as Schedule;
+          payloads.set(id, sched);
+          return new Response(JSON.stringify({ ok: true, status: "created" }), { status: 200 });
         }
       }
       return new Response("not found", { status: 404 });
     }) as typeof fetch;
 
-    // Run check: r19 should be accepted and installed
     const r19Result = await checkForUpdates(1);
     expect(r19Result.outcome).toBe("updated");
     expect((await getCurrentSchedule(1))?.metadata.source_pdf_hash).toBe(hash9);
-    expect(brokerDurableState.source_pdf_hash).toBe(hash9);
+    expect(activePointer.source_pdf_hash).toBe(hash9);
 
-    // Stage 3: r20 candidate is bad (corrupted PDF that fails parsing)
+    // Stage 3: r20 candidate is bad
     activePdfBytes = new TextEncoder().encode("%PDF-1.4 Not a valid timetable table content at all");
     currentPointer = {
       schema_version: 1,
@@ -752,15 +839,17 @@ describe("accepted-state synchronization & transaction ordering", () => {
         },
       ],
     };
+    activePageApi = makePageApiPayload([
+      { courseYear: 1, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-20.pdf" },
+    ]);
 
     const r20Result = await checkForUpdates(1);
     expect(r20Result.outcome).toBe("rejected");
 
-    // r19 remains both local and durable
     expect((await getCurrentSchedule(1))?.metadata.source_pdf_hash).toBe(hash9);
-    expect(brokerDurableState.source_pdf_hash).toBe(hash9);
+    expect(activePointer.source_pdf_hash).toBe(hash9);
 
-    // Stage 4: Wipe local files (simulate fresh container or wiped disk)
+    // Stage 4: Wipe local files
     await rm(tempDir, { recursive: true, force: true });
     tempDir = await mkdtemp(path.join(tmpdir(), "fcim-sync-test-wiped-"));
     (config as { dataDir: string }).dataDir = tempDir;
@@ -768,35 +857,26 @@ describe("accepted-state synchronization & transaction ordering", () => {
 
     expect(await getCurrentSchedule(1)).toBeNull();
 
-    // Cold-start bootstrap restores exact r19 baseline from broker
     await bootstrapScheduleState();
     const restored = await getCurrentSchedule(1);
     expect(restored).not.toBeNull();
     expect(restored?.metadata.source_pdf_hash).toBe(hash9);
 
-    // Now evaluate bad candidate r20 again -> rejected again using restored r19 baseline!
     const r20SecondResult = await checkForUpdates(1);
     expect(r20SecondResult.outcome).toBe("rejected");
     expect((await getCurrentSchedule(1))?.metadata.source_pdf_hash).toBe(hash9);
   });
 
   it("r19 validates, durable PUT fails -> local remains r18 -> restart restores r18", async () => {
-    // r18 is installed locally and durable in broker
     const r18Schedule = await makeSchedule(
       pdfBytes18,
       "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
+      1,
+      config.parserVersion,
+      "snap-r18",
     );
     await replaceCurrentSchedule(1, r18Schedule);
-
-    const brokerDurableState: AcceptedRecord = {
-      schema_version: 1,
-      course_year: 1,
-      snapshot_id: "snap-r18",
-      source_pdf_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
-      source_pdf_hash: hash18,
-      accepted_at: "2026-09-08T02:00:00.000Z",
-      schedule: r18Schedule,
-    };
+    const mockR18 = makeAcceptedMock(1, r18Schedule, "snap-r18");
 
     const candidatePointer: CurrentPointer = {
       schema_version: 1,
@@ -831,6 +911,10 @@ describe("accepted-state synchronization & transaction ordering", () => {
       ],
     };
 
+    const pageApiPayload = makePageApiPayload([
+      { courseYear: 1, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf" },
+    ]);
+
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const urlStr = String(input);
       const method = init?.method?.toUpperCase() ?? "GET";
@@ -841,16 +925,26 @@ describe("accepted-state synchronization & transaction ordering", () => {
       if (urlStr.includes("/manifest.json")) {
         return new Response(JSON.stringify(candidateManifest), { status: 200 });
       }
+      if (urlStr.includes("/page-api.json")) {
+        return new Response(JSON.stringify(pageApiPayload), { status: 200 });
+      }
       if (urlStr.endsWith(".pdf")) {
         return pdfResponse(pdfBytes9);
       }
       if (urlStr.includes("/accepted/course-1")) {
         if (method === "GET") {
-          return new Response(JSON.stringify(brokerDurableState), { status: 200 });
+          return new Response(JSON.stringify(mockR18.pointer), { status: 200 });
         }
         if (method === "PUT") {
-          // Durable write fails!
           return new Response(JSON.stringify({ error: "durable write error" }), { status: 500 });
+        }
+      }
+      if (urlStr.includes(`/accepted-payloads/course-1/${mockR18.acceptedId}`)) {
+        return new Response(JSON.stringify(mockR18.schedule), { status: 200 });
+      }
+      if (urlStr.includes("/accepted-payloads/course-1")) {
+        if (method === "PUT") {
+          return new Response(JSON.stringify({ ok: true, status: "created" }), { status: 200 });
         }
       }
       return new Response("not found", { status: 404 });
@@ -859,19 +953,191 @@ describe("accepted-state synchronization & transaction ordering", () => {
     const result = await checkForUpdates(1);
     expect(result.outcome).toBe("error");
 
-    // Local state remains r18
     const local = await getCurrentSchedule(1);
     expect(local?.metadata.source_pdf_hash).toBe(hash18);
 
-    // Wipe local cache (simulate restart/cold start)
     await rm(tempDir, { recursive: true, force: true });
     tempDir = await mkdtemp(path.join(tmpdir(), "fcim-sync-test-restart-"));
     (config as { dataDir: string }).dataDir = tempDir;
     resetStorageCache();
 
-    // Cold start restart restores r18 from broker
     await bootstrapScheduleState();
     const restored = await getCurrentSchedule(1);
     expect(restored?.metadata.source_pdf_hash).toBe(hash18);
+  });
+
+  it("Audit E-04 Hard Gate: durable-to-local resync failure halts tick immediately and never evaluates candidate", async () => {
+    // Local state is r18
+    const r18Schedule = await makeSchedule(
+      pdfBytes18,
+      "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
+      1,
+      config.parserVersion,
+      "snap-r18",
+    );
+    await replaceCurrentSchedule(1, r18Schedule);
+
+    // Durable state in broker is r19
+    const r19Schedule = await makeSchedule(
+      pdfBytes9,
+      "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-9.pdf",
+      1,
+      config.parserVersion,
+      "snap-r19",
+    );
+    const mockR19 = makeAcceptedMock(1, r19Schedule, "snap-r19");
+
+    // Candidate pointer is snap-r20
+    const candidatePointer: CurrentPointer = {
+      schema_version: 1,
+      snapshot_id: "snap-r20",
+      updated_at: "2026-09-08T03:00:00.000Z",
+      manifest_r2_key: "snapshots/snap-r20/manifest.json",
+    };
+
+    let candidatePdfFetchAttempted = false;
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes("/accepted/course-1")) {
+        return new Response(JSON.stringify(mockR19.pointer), { status: 200 });
+      }
+      if (urlStr.includes(`/accepted-payloads/course-1/${mockR19.acceptedId}`)) {
+        return new Response(JSON.stringify(mockR19.schedule), { status: 200 });
+      }
+      if (urlStr.endsWith("/current")) {
+        return new Response(JSON.stringify(candidatePointer), { status: 200 });
+      }
+      if (urlStr.includes("r20.pdf") || urlStr.includes("snap-r20")) {
+        candidatePdfFetchAttempted = true;
+        return pdfResponse(pdfBytes9);
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const storage = await import("@/lib/storage");
+    vi.spyOn(storage, "replaceCurrentSchedule").mockRejectedValueOnce(
+      new Error("Disk I/O error writing current_schedule.json"),
+    );
+
+    try {
+      const result = await checkForUpdates(1);
+      expect(result.outcome).toBe("error");
+      expect(result.message).toContain("Durable to local resync failed");
+      expect(candidatePdfFetchAttempted).toBe(false);
+      const state = await getSourceState(1);
+      expect(state.last_result).toBe("error");
+      expect(state.last_error).toContain("Durable to local resync failed");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("Audit E-10: same PDF hash reparsed under bumped parser version updates accepted pointer and payload", async () => {
+    const olderSchedule = await makeSchedule(
+      pdfBytes18,
+      "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
+      1,
+      "1.0.0",
+      "snap-r18",
+    );
+    await replaceCurrentSchedule(1, olderSchedule);
+    const mockOlder = makeAcceptedMock(1, olderSchedule, "snap-r18");
+
+    let savedPayload: Schedule | null = null;
+    let savedPointer: AcceptedPointer | null = null;
+
+    const candidatePointer: CurrentPointer = {
+      schema_version: 1,
+      snapshot_id: "snap-r18",
+      updated_at: "2026-09-08T02:30:00.000Z",
+      manifest_r2_key: "snapshots/snap-r18/manifest.json",
+    };
+
+    const candidateManifest: SnapshotManifest = {
+      schema_version: 1,
+      snapshot_id: "snap-r18",
+      previous_snapshot_id: null,
+      created_at: "2026-09-08T02:30:00.000Z",
+      source: {
+        page_api_url: "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view",
+        page_id: 1739,
+        page_modified_gmt: null,
+        retrieved_at: "2026-09-08T02:30:00.000Z",
+        etag: null,
+        last_modified: null,
+      },
+      files: [
+        {
+          filename: "anul_i_semestrul_i-18.pdf",
+          source_url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf",
+          r2_key: "snapshots/snap-r18/pdfs/anul_i_semestrul_i-18.pdf",
+          content_type: "application/pdf",
+          size: pdfBytes18.byteLength,
+          upstream_etag: '"etag-r18"',
+          upstream_last_modified: null,
+        },
+      ],
+    };
+
+    const pageApiPayload = makePageApiPayload([
+      { courseYear: 1, url: "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf" },
+    ]);
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const urlStr = String(input);
+      const method = init?.method?.toUpperCase() ?? "GET";
+
+      if (urlStr.endsWith("/current")) {
+        return new Response(JSON.stringify(candidatePointer), { status: 200 });
+      }
+      if (urlStr.includes("/manifest.json")) {
+        return new Response(JSON.stringify(candidateManifest), { status: 200 });
+      }
+      if (urlStr.includes("/page-api.json")) {
+        return new Response(JSON.stringify(pageApiPayload), { status: 200 });
+      }
+      if (urlStr.endsWith(".pdf")) {
+        return pdfResponse(pdfBytes18);
+      }
+      if (urlStr.includes("/accepted/course-1")) {
+        if (method === "GET") {
+          return new Response(JSON.stringify(mockOlder.pointer), { status: 200 });
+        }
+        if (method === "PUT") {
+          const body = JSON.parse(decodeBody(init?.body)) as {
+            expected_previous_accepted_id: string | null;
+            pointer: AcceptedPointer;
+          };
+          expect(body.expected_previous_accepted_id).toBe(mockOlder.acceptedId);
+          savedPointer = body.pointer;
+          return new Response(JSON.stringify({ ok: true, status: "updated" }), { status: 200 });
+        }
+      }
+      if (urlStr.includes(`/accepted-payloads/course-1/${mockOlder.acceptedId}`)) {
+        return new Response(JSON.stringify(mockOlder.schedule), { status: 200 });
+      }
+      if (urlStr.includes("/accepted-payloads/course-1")) {
+        if (method === "PUT") {
+          savedPayload = JSON.parse(decodeBody(init?.body)) as Schedule;
+          return new Response(JSON.stringify({ ok: true, status: "created" }), { status: 200 });
+        }
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const result = await checkForUpdates(1);
+    expect(result.outcome).toBe("updated");
+
+    expect(savedPointer).not.toBeNull();
+    const finalPointer = savedPointer as unknown as AcceptedPointer;
+    expect(finalPointer.parser_version).toBe(config.parserVersion);
+    expect(finalPointer.accepted_id).not.toBe(mockOlder.acceptedId);
+    expect(finalPointer.source_pdf_hash).toBe(hash18);
+
+    expect(savedPayload).not.toBeNull();
+    const finalPayload = savedPayload as unknown as Schedule;
+    expect(finalPayload.metadata.parser_version).toBe(config.parserVersion);
+    expect(finalPayload.metadata.source_pdf_hash).toBe(hash18);
   });
 });

@@ -13,12 +13,17 @@
  * - cron trigger                                -> Periodic candidate publication check
  */
 
-import { handleGetAccepted, handlePutAccepted } from "./accepted-handler";
+import {
+  handleGetAccepted,
+  handleGetAcceptedPayload,
+  handlePutAccepted,
+  handlePutAcceptedPayload,
+} from "./accepted-handler";
 import { publishCandidateSnapshot } from "./publisher";
 import type { Env, ExecutionContext, ScheduledEvent } from "./types";
 
 function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): Response {
-  return new Response(JSON.stringify(data, null, 2), {
+  return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json",
@@ -33,8 +38,8 @@ const worker = {
     const path = url.pathname;
     const method = request.method.toUpperCase();
 
-    // 1. Current pointer: GET /current
-    if (path === "/current" && method === "GET") {
+    // 1. Current pointer: GET /current or GET /current.json
+    if ((path === "/current" || path === "/current.json") && method === "GET") {
       const current = await env.R2_BUCKET.get("current.json");
       if (!current) {
         return jsonResponse({ error: "No candidate snapshots published yet" }, 404);
@@ -67,7 +72,25 @@ const worker = {
       });
     }
 
-    // 3. Snapshot PDF: GET /snapshots/:id/pdfs/:filename
+    // 3. Snapshot Page API: GET /snapshots/:id/page-api.json
+    const pageApiMatch = /^\/snapshots\/([^/]+)\/page-api\.json$/.exec(path);
+    if (pageApiMatch && method === "GET") {
+      const snapshotId = pageApiMatch[1];
+      const pageApiObj = await env.R2_BUCKET.get(`snapshots/${snapshotId}/page-api.json`);
+      if (!pageApiObj) {
+        return jsonResponse({ error: `page-api.json not found for snapshot ${snapshotId}` }, 404);
+      }
+      return new Response(pageApiObj.body, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          ETag: pageApiObj.httpEtag,
+          "Cache-Control": "public, max-age=3600, immutable",
+        },
+      });
+    }
+
+    // 4. Snapshot PDF: GET /snapshots/:id/pdfs/:filename
     const pdfMatch = /^\/snapshots\/([^/]+)\/pdfs\/([^/]+)$/.exec(path);
     if (pdfMatch && method === "GET") {
       const [_, snapshotId, filename] = pdfMatch;
@@ -86,7 +109,20 @@ const worker = {
       });
     }
 
-    // 4. Accepted state: /accepted/course-:courseYear
+    // 5. Accepted Immutable Payloads: /accepted-payloads/course-:courseYear/:acceptedId
+    const payloadMatch = /^\/accepted-payloads\/course-(\d+)\/([^/]+)$/.exec(path);
+    if (payloadMatch) {
+      const [_, courseYear, acceptedId] = payloadMatch;
+      if (method === "GET") {
+        return handleGetAcceptedPayload(env, courseYear, acceptedId);
+      }
+      if (method === "PUT") {
+        return handlePutAcceptedPayload(request, env, courseYear, acceptedId);
+      }
+      return jsonResponse({ error: "Method not allowed" }, 405);
+    }
+
+    // 6. Accepted CAS Pointer: /accepted/course-:courseYear
     const acceptedMatch = /^\/accepted\/course-(\d+)$/.exec(path);
     if (acceptedMatch) {
       const courseYear = acceptedMatch[1];
@@ -99,7 +135,7 @@ const worker = {
       return jsonResponse({ error: "Method not allowed" }, 405);
     }
 
-    // 5. Manual / diagnostic publish trigger: POST /publish
+    // 7. Manual / diagnostic publish trigger: POST /publish
     if (path === "/publish" && method === "POST") {
       const auth = request.headers.get("Authorization");
       if (!env.SCHEDULE_BROKER_SECRET || auth !== `Bearer ${env.SCHEDULE_BROKER_SECRET}`) {
@@ -121,12 +157,13 @@ const worker = {
 
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     console.log(`Cron triggered at ${new Date(event.scheduledTime).toISOString()}`);
-    ctx.waitUntil(
-      publishCandidateSnapshot(env).then((res) => {
-        console.log("Candidate publication cron result:", JSON.stringify(res));
-      }),
-    );
+    const res = await publishCandidateSnapshot(env);
+    console.log("Candidate publication cron result:", JSON.stringify(res));
+    if (!res.published && !res.reason?.includes("unchanged")) {
+      throw new Error(`Candidate publication failed: ${res.error ?? "Unknown error"}`);
+    }
   },
 };
 
 export default worker;
+

@@ -29,6 +29,7 @@ import type {
 
 const DEFAULT_PAGE_API_URL = "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view";
 const MAX_PDF_BYTES = 25 * 1024 * 1024; // 25 MB cap
+const IF_NONE_MATCH_HEADERS = new Headers({ "If-None-Match": "*" });
 
 /**
  * Generate a collision-safe snapshot identifier.
@@ -97,9 +98,11 @@ export async function publishCandidateSnapshot(
     try {
       const currentPointer = (await currentObj.json()) as CurrentPointer;
       previousSnapshotId = currentPointer.snapshot_id;
-      const prevManifestObj = await env.R2_BUCKET.get(currentPointer.manifest_r2_key);
-      if (prevManifestObj) {
-        previousManifest = (await prevManifestObj.json()) as SnapshotManifest;
+      if (!options.force && currentPointer.manifest_r2_key) {
+        const prevManifestObj = await env.R2_BUCKET.get(currentPointer.manifest_r2_key);
+        if (prevManifestObj) {
+          previousManifest = (await prevManifestObj.json()) as SnapshotManifest;
+        }
       }
     } catch (err) {
       console.warn("Failed to parse existing current.json or manifest:", err);
@@ -126,6 +129,7 @@ export async function publishCandidateSnapshot(
 
   let pageApiNotModified = pageApiResponse.status === 304;
   let pageApiPayload: unknown = null;
+  let pageApiRawText = "";
   let pageApiEtag = pageApiResponse.headers.get("ETag");
   let pageApiLastModified = pageApiResponse.headers.get("Last-Modified");
 
@@ -142,9 +146,17 @@ export async function publishCandidateSnapshot(
         if (headRes.status === 200) {
           pdfChanged = true;
           break;
+        } else if (headRes.status !== 304) {
+          return {
+            published: false,
+            error: `Conditional check for PDF ${file.source_url} returned HTTP ${headRes.status}`,
+          };
         }
       } catch (err) {
-        console.warn(`Conditional check failed for ${file.source_url}:`, err);
+        return {
+          published: false,
+          error: `Conditional check for PDF ${file.source_url} failed: ${(err as Error).message}`,
+        };
       }
     }
 
@@ -156,7 +168,12 @@ export async function publishCandidateSnapshot(
     if (!fullPageRes.ok) {
       return { published: false, error: `Failed to fetch full Page API: HTTP ${fullPageRes.status}` };
     }
-    pageApiPayload = await fullPageRes.json();
+    try {
+      pageApiRawText = await fullPageRes.text();
+      pageApiPayload = JSON.parse(pageApiRawText);
+    } catch (err) {
+      return { published: false, error: `Invalid JSON from Page API: ${(err as Error).message}` };
+    }
     pageApiEtag = fullPageRes.headers.get("ETag") ?? pageApiEtag;
     pageApiLastModified = fullPageRes.headers.get("Last-Modified") ?? pageApiLastModified;
     pageApiNotModified = false;
@@ -165,7 +182,8 @@ export async function publishCandidateSnapshot(
       return { published: false, error: `Page API returned HTTP ${pageApiResponse.status}` };
     }
     try {
-      pageApiPayload = await pageApiResponse.json();
+      pageApiRawText = await pageApiResponse.text();
+      pageApiPayload = JSON.parse(pageApiRawText);
     } catch (err) {
       return { published: false, error: `Invalid JSON from Page API: ${(err as Error).message}` };
     }
@@ -206,9 +224,17 @@ export async function publishCandidateSnapshot(
         if (headRes.status === 200) {
           pdfChanged = true;
           break;
+        } else if (headRes.status !== 304) {
+          return {
+            published: false,
+            error: `Conditional check for PDF ${file.source_url} returned HTTP ${headRes.status}`,
+          };
         }
       } catch (err) {
-        console.warn(`Conditional check failed for ${file.source_url}:`, err);
+        return {
+          published: false,
+          error: `Conditional check for PDF ${file.source_url} failed: ${(err as Error).message}`,
+        };
       }
     }
 
@@ -225,77 +251,80 @@ export async function publishCandidateSnapshot(
 
   const snapshotId = generateSnapshotId();
   const snapshotCreated = new Date().toISOString();
-  const snapshotFiles: SnapshotFile[] = [];
 
-  // Step 5: Write all new immutable PDF objects via streaming
-  for (const pdfUrl of pdfUrls) {
-    const filename = getPdfFilename(pdfUrl);
-    const r2Key = `snapshots/${snapshotId}/pdfs/${filename}`;
+  // Step 5: Write all new immutable PDF objects via streaming with create-only semantics (concurrent)
+  let snapshotFiles: SnapshotFile[];
+  try {
+    snapshotFiles = await Promise.all(
+      pdfUrls.map(async (pdfUrl) => {
+        const filename = getPdfFilename(pdfUrl);
+        const r2Key = `snapshots/${snapshotId}/pdfs/${filename}`;
 
-    let pdfRes: Response;
-    try {
-      pdfRes = await fetchSafePdf(pdfUrl);
-    } catch (err) {
-      console.error(`Failed to fetch PDF ${pdfUrl}:`, err);
-      return { published: false, error: `Failed to fetch PDF ${pdfUrl}: ${(err as Error).message}` };
+        const pdfRes = await fetchSafePdf(pdfUrl);
+        if (!pdfRes.ok) {
+          throw new Error(`PDF ${pdfUrl} returned HTTP ${pdfRes.status}`);
+        }
+
+        // Sanity checks on headers
+        const contentType = pdfRes.headers.get("Content-Type");
+        const contentLength = pdfRes.headers.get("Content-Length");
+        const sizeBytes = contentLength ? Number(contentLength) : null;
+        if (sizeBytes !== null && sizeBytes > MAX_PDF_BYTES) {
+          throw new Error(`PDF ${pdfUrl} exceeds size limit (${sizeBytes} bytes)`);
+        }
+
+        const upstreamEtag = pdfRes.headers.get("ETag");
+        const upstreamLastModified = pdfRes.headers.get("Last-Modified");
+
+        if (!pdfRes.body) {
+          throw new Error(`PDF ${pdfUrl} returned empty body`);
+        }
+
+        // Stream directly into R2.put() with If-None-Match: * (create-only)
+        const r2Put = await env.R2_BUCKET.put(r2Key, pdfRes.body, {
+          onlyIf: IF_NONE_MATCH_HEADERS,
+          httpMetadata: {
+            contentType: contentType ?? "application/pdf",
+          },
+          customMetadata: {
+            source_url: pdfUrl,
+            upstream_etag: upstreamEtag ?? "",
+            upstream_last_modified: upstreamLastModified ?? "",
+          },
+        });
+
+        if (!r2Put) {
+          throw new Error(`COLLISION:PDF ${r2Key} already exists under immutable snapshot`);
+        }
+
+        return {
+          filename,
+          source_url: pdfUrl,
+          r2_key: r2Key,
+          content_type: contentType,
+          size: sizeBytes ?? r2Put.size,
+          upstream_etag: upstreamEtag,
+          upstream_last_modified: upstreamLastModified,
+        };
+      }),
+    );
+  } catch (err) {
+    const msg = (err as Error).message;
+    if (msg.startsWith("COLLISION:")) {
+      return {
+        published: false,
+        conflict: true,
+        error: msg.slice("COLLISION:".length),
+      };
     }
-
-    if (!pdfRes.ok) {
-      return { published: false, error: `PDF ${pdfUrl} returned HTTP ${pdfRes.status}` };
-    }
-
-    // Sanity checks on headers
-    const contentType = pdfRes.headers.get("Content-Type");
-    const contentLength = pdfRes.headers.get("Content-Length");
-    const sizeBytes = contentLength ? Number(contentLength) : null;
-    if (sizeBytes !== null && sizeBytes > MAX_PDF_BYTES) {
-      return { published: false, error: `PDF ${pdfUrl} exceeds size limit (${sizeBytes} bytes)` };
-    }
-
-    const upstreamEtag = pdfRes.headers.get("ETag");
-    const upstreamLastModified = pdfRes.headers.get("Last-Modified");
-
-    if (!pdfRes.body) {
-      return { published: false, error: `PDF ${pdfUrl} returned empty body` };
-    }
-
-    // Stream directly into R2.put() without buffering in worker memory
-    const r2Put = await env.R2_BUCKET.put(r2Key, pdfRes.body, {
-      httpMetadata: {
-        contentType: contentType ?? "application/pdf",
-      },
-      customMetadata: {
-        source_url: pdfUrl,
-        upstream_etag: upstreamEtag ?? "",
-        upstream_last_modified: upstreamLastModified ?? "",
-      },
-    });
-
-    if (!r2Put) {
-      return { published: false, error: `Failed to write PDF object ${r2Key} to R2` };
-    }
-
-    snapshotFiles.push({
-      filename,
-      source_url: pdfUrl,
-      r2_key: r2Key,
-      content_type: contentType,
-      size: sizeBytes ?? r2Put.size,
-      upstream_etag: upstreamEtag,
-      upstream_last_modified: upstreamLastModified,
-    });
+    return {
+      published: false,
+      error: msg,
+    };
   }
 
-  // Step 6: Write page-api.json
+  // Step 6 & 7: Write page-api.json and manifest.json with create-only semantics concurrently
   const pageApiKey = `snapshots/${snapshotId}/page-api.json`;
-  const pageApiWritten = await env.R2_BUCKET.put(pageApiKey, JSON.stringify(pageApiPayload, null, 2), {
-    httpMetadata: { contentType: "application/json" },
-  });
-  if (!pageApiWritten) {
-    return { published: false, error: "Failed to write page-api.json to R2" };
-  }
-
-  // Step 7: Write manifest.json
   const manifest: SnapshotManifest = {
     schema_version: 1,
     snapshot_id: snapshotId,
@@ -311,16 +340,36 @@ export async function publishCandidateSnapshot(
     },
     files: snapshotFiles,
   };
-
   const manifestKey = `snapshots/${snapshotId}/manifest.json`;
-  const manifestWritten = await env.R2_BUCKET.put(manifestKey, JSON.stringify(manifest, null, 2), {
-    httpMetadata: { contentType: "application/json" },
-  });
-  if (!manifestWritten) {
-    return { published: false, error: "Failed to write manifest.json to R2" };
+
+  const [pageApiWritten, manifestWritten] = await Promise.all([
+    env.R2_BUCKET.put(pageApiKey, pageApiRawText, {
+      onlyIf: IF_NONE_MATCH_HEADERS,
+      httpMetadata: { contentType: "application/json" },
+    }),
+    env.R2_BUCKET.put(manifestKey, JSON.stringify(manifest), {
+      onlyIf: IF_NONE_MATCH_HEADERS,
+      httpMetadata: { contentType: "application/json" },
+    }),
+  ]);
+
+  if (!pageApiWritten) {
+    return {
+      published: false,
+      conflict: true,
+      error: `Collision: ${pageApiKey} already exists under immutable snapshot`,
+    };
   }
 
-  // Step 8: CAS current.json LAST
+  if (!manifestWritten) {
+    return {
+      published: false,
+      conflict: true,
+      error: `Collision: ${manifestKey} already exists under immutable snapshot`,
+    };
+  }
+
+  // Step 8: CAS current.json LAST (compact JSON)
   const nextPointer: CurrentPointer = {
     schema_version: 1,
     snapshot_id: snapshotId,
@@ -330,11 +379,11 @@ export async function publishCandidateSnapshot(
 
   const putOptions: R2PutOptions = currentEtag
     ? { onlyIf: { etagMatches: currentEtag } }
-    : { onlyIf: new Headers({ "If-None-Match": "*" }) };
+    : { onlyIf: IF_NONE_MATCH_HEADERS };
 
   const casResult = await env.R2_BUCKET.put(
     "current.json",
-    JSON.stringify(nextPointer, null, 2),
+    JSON.stringify(nextPointer),
     putOptions,
   );
 

@@ -45,6 +45,7 @@ export interface R2ObjectBody extends R2Object {
 }
 
 export interface R2Bucket {
+  head(key: string): Promise<R2Object | null>;
   get(key: string): Promise<R2ObjectBody | null>;
   put(
     key: string,
@@ -108,6 +109,32 @@ export interface CurrentPointer {
   manifest_r2_key: string;
 }
 
+export interface AcceptedPointer {
+  schema_version: 1;
+  course_year: number;
+  accepted_id: string;
+  payload_key: string;
+  payload_sha256: string;
+  source_snapshot_id: string;
+  source_pdf_url: string;
+  source_pdf_hash: string;
+  parser_version: string;
+  accepted_at: string;
+}
+
+export interface AcceptedPointerWriteRequest {
+  expected_previous_accepted_id: string | null;
+  pointer: AcceptedPointer;
+}
+
+export interface AcceptedPayloadMetadata {
+  course_year: string;
+  source_pdf_hash: string;
+  snapshot_id: string;
+  parser_version: string;
+  payload_sha256: string;
+}
+
 export interface AcceptedRecord {
   schema_version: 1;
   course_year: number;
@@ -130,3 +157,4 @@ export interface PublishResult {
   conflict?: boolean;
   error?: string;
 }
+

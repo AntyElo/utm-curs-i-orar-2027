@@ -147,12 +147,35 @@ export const CurrentPointerSchema = z.object({
 });
 export type CurrentPointer = z.infer<typeof CurrentPointerSchema>;
 
+export const AcceptedPointerSchema = z.object({
+  schema_version: z.literal(1).default(1),
+  course_year: z.number().int(),
+  accepted_id: z.string(),
+  payload_key: z.string(),
+  payload_sha256: z.string().regex(/^[a-f0-9]{64}$/i, "expected 64-character SHA-256 hash"),
+  source_snapshot_id: z.string(),
+  source_pdf_url: z.string(),
+  source_pdf_hash: z.string().regex(/^[a-f0-9]{64}$/i, "expected 64-character SHA-256 hash"),
+  parser_version: z.string(),
+  accepted_at: z.string(),
+});
+export type AcceptedPointer = z.infer<typeof AcceptedPointerSchema>;
+
+export const AcceptedPointerWriteRequestSchema = z.object({
+  expected_previous_accepted_id: z.string().nullable(),
+  pointer: AcceptedPointerSchema,
+});
+export type AcceptedPointerWriteRequest = z.infer<typeof AcceptedPointerWriteRequestSchema>;
+
 export const AcceptedRecordSchema = z.object({
   schema_version: z.literal(1).default(1),
   course_year: z.number().int(),
+  accepted_id: z.string().optional(),
   snapshot_id: z.string(),
   source_pdf_url: z.string(),
   source_pdf_hash: z.string().regex(/^[a-f0-9]{64}$/i, "expected 64-character SHA-256 hash"),
+  parser_version: z.string().optional(),
+  payload_sha256: z.string().regex(/^[a-f0-9]{64}$/i, "expected 64-character SHA-256 hash").optional(),
   accepted_at: z.string(),
   schedule: ScheduleSchema,
 });
