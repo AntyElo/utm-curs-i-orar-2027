@@ -3,13 +3,6 @@
  */
 
 /**
- * Identify ourselves. An absent User-Agent is a common WAF trigger, and the broker has no
- * interest in looking like a browser — it just needs to be nameable in an upstream log.
- */
-export const BROKER_USER_AGENT =
-  "Mozilla/5.0 (compatible; fcim-schedule-bot/1.0; +https://github.com/fcim-schedule)";
-
-/**
  * Normalise a cache validator.
  *
  * FCIM answers with a present-but-empty `etag:` header. An empty validator is not a validator —

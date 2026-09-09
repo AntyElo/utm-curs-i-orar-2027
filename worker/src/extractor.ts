@@ -9,68 +9,17 @@
  * - Pure regex and URL checks
  */
 
-const OFFICIAL_TIMETABLE_PDF_PATH =
-  /^\/wp-content\/uploads\/sites\/24\/\d{4}\/(?:0[1-9]|1[0-2])\/[a-zA-Z0-9_\-.]+\.pdf$/i;
+import { isOfficialTimetablePdfUrl } from "../../worker-shared/fcim-policy";
 
-// Rejects double-encoding, traversal encodings, and backslashes
-const DANGEROUS_RAW_PATTERN = /(?:%25|%2e|%2f|%5c|\.\.|\\)/i;
+export {
+  isAllowedPageApiUrl,
+  isOfficialTimetablePdfUrl,
+} from "../../worker-shared/fcim-policy";
 
 const HREF_PDF_REGEX =
   /href\s*=\s*["']([^"']*(?:\/wp-content\/uploads\/sites\/24\/\d{4}\/(?:0[1-9]|1[0-2])\/[^"'\s<>]+\.pdf))["']/gi;
 const RAW_URL_REGEX =
   /(?:^|[\s"'<>])(https:\/\/fcim\.utm\.md\/wp-content\/uploads\/sites\/24\/\d{4}\/(?:0[1-9]|1[0-2])\/[a-zA-Z0-9_\-.]+\.pdf)(?=[\s"'<>&,]|$)/gi;
-
-/**
- * Strict policy for official timetable PDF URLs.
- * Rejects non-https, external hosts, directory traversal, credentials, non-standard ports,
- * queries, fragments, and malicious suffixes (e.g. .pdf.evil).
- */
-export function isOfficialTimetablePdfUrl(rawUrl: string): boolean {
-  if (typeof rawUrl !== "string" || rawUrl.length === 0) {
-    return false;
-  }
-
-  // Pre-normalization checks on the raw string:
-  // Reject traversal, double encoding, backslashes, query params, fragments
-  if (DANGEROUS_RAW_PATTERN.test(rawUrl)) {
-    return false;
-  }
-  if (rawUrl.includes("?") || rawUrl.includes("#")) {
-    return false;
-  }
-  if (!rawUrl.startsWith("https://fcim.utm.md/")) {
-    return false;
-  }
-
-  // Pathname is strictly everything after "https://fcim.utm.md" (length 19)
-  const pathname = rawUrl.slice(19);
-
-  // Check pathname matches approved directory structure and basename
-  return OFFICIAL_TIMETABLE_PDF_PATH.test(pathname);
-}
-
-/**
- * Strict policy for WordPress Page API URL.
- * Exactly requires:
- * - https://fcim.utm.md/wp-json/wp/v2/pages
- * - query parameters: slug=orar & context=view (no other parameters allowed)
- */
-export function isAllowedPageApiUrl(rawUrl: string): boolean {
-  if (typeof rawUrl !== "string" || rawUrl.length === 0) {
-    return false;
-  }
-
-  if (DANGEROUS_RAW_PATTERN.test(rawUrl)) {
-    return false;
-  }
-
-  if (!rawUrl.startsWith("https://fcim.utm.md/wp-json/wp/v2/pages?")) {
-    return false;
-  }
-
-  const queryStr = rawUrl.slice(40); // "https://fcim.utm.md/wp-json/wp/v2/pages?".length === 40
-  return queryStr === "slug=orar&context=view" || queryStr === "context=view&slug=orar";
-}
 
 /**
  * Extract official timetable PDF URLs from HTML without using cheerio or heavy DOM libraries.

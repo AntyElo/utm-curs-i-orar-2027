@@ -8,6 +8,11 @@ minify = true
 binding = "R2_BUCKET"
 bucket_name = "fcim-schedule-broker"
 
+# Internal HTTP transport through the Stockholm-placed downstream Worker's default fetch handler.
+[[services]]
+binding = "FCIM_EGRESS"
+service = "fcim-stockholm-egress"
+
 # Split publication transport. Discovery enqueues one bounded job per PDF plus a finalize job;
 # every message is handled in its own invocation with its own CPU budget.
 [[queues.producers]]

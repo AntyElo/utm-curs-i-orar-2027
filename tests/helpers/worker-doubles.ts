@@ -9,6 +9,7 @@
  * production, and honours `retry()` with a bounded attempt count and a dead-letter list.
  */
 
+import stockholmEgressWorker from "../../worker-egress/src/index";
 import type {
   Env,
   ExecutionContext,
@@ -22,7 +23,32 @@ import type {
   R2ObjectBody,
   R2Objects,
   R2PutOptions,
+  ServiceBinding,
 } from "../../worker/src/types";
+
+export interface EgressRequestRecord {
+  url: string;
+  method: string;
+  body: string;
+}
+
+/**
+ * In-process HTTP Service Binding. It records the main Worker's internal fetch and dispatches it
+ * to the backend's real default.fetch handler; only that backend reaches the test's global fetch.
+ */
+export class MockServiceBinding implements ServiceBinding {
+  readonly requests: EgressRequestRecord[] = [];
+
+  async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const request = input instanceof Request && init === undefined ? input : new Request(input, init);
+    this.requests.push({
+      url: request.url,
+      method: request.method,
+      body: await request.clone().text(),
+    });
+    return stockholmEgressWorker.fetch(request);
+  }
+}
 
 interface StoredObject {
   data: Uint8Array;
@@ -258,19 +284,22 @@ export interface WorkerHarness {
   env: Env;
   bucket: MockR2Bucket;
   queue: MockQueue;
+  egress: MockServiceBinding;
   ctx: ExecutionContext;
 }
 
 export function createHarness(overrides: Partial<Env> = {}): WorkerHarness {
   const bucket = new MockR2Bucket();
   const queue = new MockQueue();
+  const egress = new MockServiceBinding();
   const env: Env = {
     R2_BUCKET: bucket,
     PUBLICATION_QUEUE: queue,
+    FCIM_EGRESS: egress,
     SCHEDULE_BROKER_SECRET: "test-secret",
     ...overrides,
   };
-  return { env, bucket, queue, ctx: createExecutionContext() };
+  return { env, bucket, queue, egress, ctx: createExecutionContext() };
 }
 
 export interface DrainResult {

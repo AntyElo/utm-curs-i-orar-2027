@@ -107,9 +107,15 @@ export interface ScheduledEvent {
   scheduledTime: number;
 }
 
+/** Minimal HTTP Service Binding surface used by the Stockholm transport Worker. */
+export interface ServiceBinding {
+  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+}
+
 export interface Env {
   R2_BUCKET: R2Bucket;
   PUBLICATION_QUEUE: Queue<PublicationJob>;
+  FCIM_EGRESS: ServiceBinding;
   SCHEDULE_BROKER_SECRET?: string;
   FCIM_PAGE_API_URL?: string;
   SCHEDULE_PAGE_URL?: string;

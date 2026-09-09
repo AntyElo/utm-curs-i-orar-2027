@@ -457,6 +457,41 @@ describe("split publication: error matrix", () => {
     expect(drain.deadLettered).toBe(1);
     expect(h.bucket.has("current.json")).toBe(false);
   });
+
+  it("recovers on the next scheduled cycle after a discovery job is dead-lettered", async () => {
+    let healthy = false;
+    installFetch({
+      page: async () =>
+        healthy
+          ? new Response(pagePayload(), { status: 200, headers: { "Content-Type": "application/json" } })
+          : new Response("denied", { status: 403 }),
+    });
+    const h = harness();
+
+    // First cron tick: FCIM is down for the whole retry budget, so the message is dead-lettered
+    // and current.json is left exactly as it was (absent, here).
+    await worker.scheduled(
+      { cron: "*/20 * * * *", type: "scheduled", scheduledTime: Date.now() },
+      h.env,
+      h.ctx,
+    );
+    const firstDrain = await drainQueue(h, worker.queue);
+    expect(firstDrain.deadLettered).toBe(1);
+    expect(h.bucket.has("current.json")).toBe(false);
+
+    // FCIM recovers before the next normal cron tick fires — no manual/administrative action.
+    healthy = true;
+    await worker.scheduled(
+      { cron: "*/20 * * * *", type: "scheduled", scheduledTime: Date.now() },
+      h.env,
+      h.ctx,
+    );
+    const secondDrain = await drainQueue(h, worker.queue);
+    expect(secondDrain.deadLettered).toBe(0);
+
+    const pointer = parseCurrentPointer(h.bucket.text("current.json")!);
+    expect(pointer.ok).toBe(true);
+  });
 });
 
 describe("split publication: PDF ingest jobs", () => {
@@ -754,6 +789,35 @@ describe("split publication: reconciliation", () => {
     const result = await runReconcile(h.env);
     expect(result.requeued_ingests).toBe(0);
     expect(result.requeued_finalizes).toBe(0);
+  });
+
+  it("does not re-fetch a pending snapshot whose observed current ETag is superseded", async () => {
+    installFetch({});
+    const h = harness();
+    const discovery = await runDiscovery(h.env);
+    const snapshotId = discovery.snapshot_id!;
+    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(snapshotId))!;
+    const agedId = agedSnapshotId(30, "dead0002");
+    h.bucket.seed(
+      pendingDescriptorKey(agedId),
+      JSON.stringify({
+        ...descriptor,
+        snapshot_id: agedId,
+        files: descriptor.files.map((file) => ({
+          ...file,
+          r2_key: file.r2_key.replace(snapshotId, agedId),
+        })),
+      }),
+    );
+    h.bucket.seed("current.json", JSON.stringify({ superseding: true }));
+
+    const before = h.queue.sent.length;
+    const result = await runReconcile(h.env);
+
+    expect(result.outcome).toBe("idle");
+    expect(result.requeued_ingests).toBe(0);
+    expect(result.requeued_finalizes).toBe(0);
+    expect(h.queue.sent).toHaveLength(before);
   });
 });
 

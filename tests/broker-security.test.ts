@@ -510,7 +510,7 @@ describe("E-08: Page API redirect safety", () => {
     const spy = stubFetch(
       () => new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } }),
     );
-    await fetchPageApi(PAGE_API_URL);
+    await fetchPageApi(createHarness().env, PAGE_API_URL);
     const init = spy.mock.calls[0][1] as RequestInit;
     expect(init.redirect).toBe("manual");
   });
@@ -526,15 +526,15 @@ describe("E-08: Page API redirect safety", () => {
   for (const { name, location } of redirects) {
     it(`refuses a redirect to ${name}`, async () => {
       stubFetch(() => new Response(null, { status: 302, headers: { Location: location } }));
-      await expect(fetchPageApi(PAGE_API_URL)).rejects.toThrow(PageApiError);
-      await expect(fetchPageApi(PAGE_API_URL)).rejects.toThrow(/redirect/i);
+      await expect(fetchPageApi(createHarness().env, PAGE_API_URL)).rejects.toThrow(PageApiError);
+      await expect(fetchPageApi(createHarness().env, PAGE_API_URL)).rejects.toThrow(/redirect/i);
     });
   }
 
   for (const status of [301, 303, 307, 308]) {
     it(`refuses an HTTP ${status} redirect`, async () => {
       stubFetch(() => new Response(null, { status, headers: { Location: "https://evil.example/" } }));
-      await expect(fetchPageApi(PAGE_API_URL)).rejects.toThrow(/redirect/i);
+      await expect(fetchPageApi(createHarness().env, PAGE_API_URL)).rejects.toThrow(/redirect/i);
     });
   }
 });

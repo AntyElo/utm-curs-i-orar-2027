@@ -165,7 +165,8 @@ cron (*/20) or authenticated POST /publish   producer-only; enqueue discovery
 DISCOVERY            one Queue invocation
   ├─ read current.json, parse the strict or exact legacy shape, keep its ETag as the CAS token
   ├─ load legacy Page/PDF validators from that pointer's immutable manifest (never fabricate them)
-  ├─ GET the Page API (redirect: manual — a redirect is refused, never followed)
+  ├─ call `FCIM_EGRESS.fetch()` through the private HTTP Service Binding
+  ├─ Stockholm backend fetch handler GETs the exact Page API (manual redirect — always refused)
   ├─ unchanged?  modified_gmt equal + same PDF catalogue + every mirrored PDF 304  ──▶ stop
   ├─ write snapshots/<id>/page-api.json          (create-only)
   ├─ write pending/<id>/descriptor.json          (create-only; fixes the expected file set)
@@ -174,7 +175,8 @@ DISCOVERY            one Queue invocation
   ▼
 PDF INGEST           one invocation per PDF
   ├─ re-validate the job against the descriptor
-  ├─ GET the PDF (redirects re-checked against the same URL policy)
+  ├─ call the same Service Binding with the descriptor's dynamic official PDF URL
+  ├─ Stockholm backend streams the PDF (every redirect is re-checked against the shared policy)
   ├─ stream the body into snapshots/<id>/pdfs/<file>   (create-only, byte-capped)
   ├─ write pending/<id>/completed/<file-id>.json       (create-only)
   └─ enqueue a finalize
@@ -198,13 +200,23 @@ snapshot reports success without touching it. Completion is recorded as one immu
 file rather than a shared counter, because two concurrent ingests can lose an update to a counter
 and cannot lose disjoint keys.
 
+`fcim-stockholm-egress` is a second, internal-only Worker configured with
+`placement.region = "aws:eu-north-1"`, `workers_dev = false`, no route, and no custom domain. The
+broker reaches its default fetch handler only through an HTTP Service Binding. Its two private POST
+operations permit only the canonical Page API and strict official upload URLs. It forwards only
+content type/length, validators, last-modified, and safe placement/ray diagnostics, and returns PDF
+bodies as streams. All descriptor, R2, Queue, manifest, CAS, parsing, selection, and accepted-state
+responsibilities remain in the broker or Render.
+
 Failures are visible rather than absorbed. The queue processes one message at a time, retries at
 most three times, waits 300 seconds between retryable attempts, and sends exhausted messages to
 `fcim-broker-publication-dlq`. Network failures and upstream 403, 429 and 5xx responses are
 retryable; malformed jobs, invalid immutable state and security-policy rejections are logged and
 acknowledged because another attempt cannot change them. A snapshot left unfinished is re-driven
 by a reconciliation pass the cron queues each tick, which re-enqueues only the ingest jobs whose
-completion markers are missing. A Page API redirect or other deterministic failure is still an
+completion markers are missing and whose recorded `current.json` ETag can still win the CAS.
+Already-superseded or aged-out SEA-era pending snapshots therefore cause no new FCIM traffic. A
+Page API redirect or other deterministic failure is still an
 error — the previous `current.json` is left exactly as it was. Only a genuine 304 (or an unchanged
 `modified_gmt` with an unchanged catalogue and unchanged PDFs) means "unchanged".
 

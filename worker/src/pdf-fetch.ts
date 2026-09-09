@@ -7,23 +7,17 @@
  * legitimately move between https variants, so a validated hop is allowed here.
  */
 
-import { isOfficialTimetablePdfUrl } from "./extractor";
-import { BROKER_USER_AGENT } from "./http";
+import {
+  FcimEgressClientError,
+  egressErrorDetail,
+  egressErrorKind,
+  fetchThroughStockholmEgress,
+} from "./fcim-egress-client";
+import type { Env } from "./types";
+import { isOfficialTimetablePdfUrl } from "../../worker-shared/fcim-policy";
 
 /** Upper bound on a single mirrored timetable; the largest real FCIM PDF is ~1.3 MB. */
 export const MAX_PDF_BYTES = 25 * 1024 * 1024;
-
-const MAX_REDIRECTS = 5;
-const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
-
-const BASE_PDF_FETCH_OPTIONS: RequestInit = {
-  method: "GET",
-  redirect: "manual",
-  cf: {
-    cacheEverything: true,
-    cacheTtl: 3600,
-  },
-} as RequestInit;
 
 export class PdfFetchError extends Error {
   readonly status: number | null;
@@ -39,43 +33,36 @@ export class PdfFetchError extends Error {
  * The response body is returned unread so the caller can stream it straight into R2.
  */
 export async function fetchOfficialPdf(
+  env: Env,
   url: string,
   extraHeaders?: Record<string, string>,
 ): Promise<Response> {
-  let currentUrl = url;
-
-  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    if (!isOfficialTimetablePdfUrl(currentUrl)) {
-      throw new PdfFetchError(`Unsafe PDF URL rejected by allowlist: ${currentUrl}`);
-    }
-
-    const headers: Record<string, string> = {
-      Accept: "application/pdf,*/*;q=0.8",
-      "User-Agent": BROKER_USER_AGENT,
-      ...extraHeaders,
-    };
-
-    let response: Response;
-    try {
-      response = await fetch(currentUrl, { ...BASE_PDF_FETCH_OPTIONS, headers });
-    } catch (err) {
-      throw new PdfFetchError(`PDF network error for ${currentUrl}: ${(err as Error).message}`);
-    }
-
-    if (!REDIRECT_STATUSES.has(response.status)) {
-      return response;
-    }
-
-    const location = response.headers.get("Location");
-    if (!location) {
-      throw new PdfFetchError(`Redirect from ${currentUrl} has no Location header`, response.status);
-    }
-    try {
-      currentUrl = new URL(location, currentUrl).toString();
-    } catch {
-      throw new PdfFetchError(`Redirect from ${currentUrl} has an unparseable Location: ${location}`);
-    }
+  if (!isOfficialTimetablePdfUrl(url)) {
+    throw new PdfFetchError(`Unsafe PDF URL rejected by allowlist: ${url}`);
   }
 
-  throw new PdfFetchError(`Too many redirects fetching PDF: ${url}`);
+  const conditional = {
+    etag: extraHeaders?.["If-None-Match"],
+    lastModified: extraHeaders?.["If-Modified-Since"],
+  };
+
+  let response: Response;
+  try {
+    response = await fetchThroughStockholmEgress(env, "PDF", url, conditional);
+  } catch (err) {
+    if (err instanceof FcimEgressClientError) {
+      throw new PdfFetchError(`PDF ${err.message}`, err.status);
+    }
+    throw new PdfFetchError(`PDF network error for ${url}: ${(err as Error).message}`);
+  }
+
+  const relayError = egressErrorKind(response);
+  if (relayError) {
+    const detail = await egressErrorDetail(response);
+    throw new PdfFetchError(
+      `PDF Stockholm transport rejected the request (${relayError})${detail ? `: ${detail}` : ""}`,
+      response.status,
+    );
+  }
+  return response;
 }

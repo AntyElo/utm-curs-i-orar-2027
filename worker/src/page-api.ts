@@ -8,11 +8,21 @@
  * upstream configuration decide which host we take our catalogue of PDFs from.
  */
 
-import { isAllowedPageApiUrl } from "./extractor";
-import { BROKER_USER_AGENT, validatorOrNull } from "./http";
+import {
+  FcimEgressClientError,
+  egressErrorDetail,
+  egressErrorKind,
+  fetchThroughStockholmEgress,
+} from "./fcim-egress-client";
+import { validatorOrNull } from "./http";
+import type { Env } from "./types";
+import {
+  CANONICAL_PAGE_API_URL,
+  FCIM_UPSTREAM_CF_RAY_HEADER,
+  isAllowedPageApiUrl,
+} from "../../worker-shared/fcim-policy";
 
-export const DEFAULT_PAGE_API_URL =
-  "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view";
+export const DEFAULT_PAGE_API_URL = CANONICAL_PAGE_API_URL;
 
 /** WordPress page payloads are small; a much larger body is not the document we asked for. */
 export const MAX_PAGE_API_BYTES = 4 * 1024 * 1024;
@@ -53,6 +63,7 @@ export function resolvePageApiUrl(configured: string | undefined): string {
  * (a 403 challenge and a 500 both mean "we do not know the upstream state", never "unchanged").
  */
 export async function fetchPageApi(
+  env: Env,
   url: string,
   conditional: { etag?: string | null; lastModified?: string | null } = {},
 ): Promise<PageApiResponse> {
@@ -60,18 +71,26 @@ export async function fetchPageApi(
     throw new PageApiError(`Invalid Page API URL: ${url}`);
   }
 
-  const headers: Record<string, string> = {
-    Accept: "application/json",
-    "User-Agent": BROKER_USER_AGENT,
-  };
-  if (conditional.etag) headers["If-None-Match"] = conditional.etag;
-  if (conditional.lastModified) headers["If-Modified-Since"] = conditional.lastModified;
-
   let response: Response;
   try {
-    response = await fetch(url, { method: "GET", headers, redirect: "manual" });
+    response = await fetchThroughStockholmEgress(env, "PAGE_API", url, {
+      etag: conditional.etag,
+      lastModified: conditional.lastModified,
+    });
   } catch (err) {
+    if (err instanceof FcimEgressClientError) {
+      throw new PageApiError(`Page API ${err.message}`, err.status);
+    }
     throw new PageApiError(`Page API network error: ${(err as Error).message}`);
+  }
+
+  const relayError = egressErrorKind(response);
+  if (relayError) {
+    const detail = await egressErrorDetail(response);
+    throw new PageApiError(
+      `Page API Stockholm transport rejected the request (${relayError})${detail ? `: ${detail}` : ""}`,
+      response.status,
+    );
   }
 
   if (REDIRECT_STATUSES.has(response.status)) {
@@ -95,7 +114,7 @@ export async function fetchPageApi(
   if (response.status !== 200) {
     // FCIM sits behind Cloudflare and challenges some edge locations, so the upstream ray id is
     // the difference between "the site is down" and "this colo is being refused" when reading logs.
-    const ray = response.headers.get("cf-ray");
+    const ray = response.headers.get(FCIM_UPSTREAM_CF_RAY_HEADER);
     throw new PageApiError(
       `Page API returned HTTP ${response.status}${ray ? ` (upstream cf-ray ${ray})` : ""}`,
       response.status,

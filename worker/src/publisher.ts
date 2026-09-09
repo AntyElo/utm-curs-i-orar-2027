@@ -113,13 +113,13 @@ async function loadPreviousManifest(
  * Bodies are never read — a 304 means unchanged, a 200 means the upstream replaced a document
  * in place under the same URL, and anything else is an error rather than a quiet "unchanged".
  */
-async function anyPreviousPdfChanged(manifest: SnapshotManifest): Promise<boolean> {
+async function anyPreviousPdfChanged(env: Env, manifest: SnapshotManifest): Promise<boolean> {
   const checks = manifest.files.map(async (file) => {
     const headers: Record<string, string> = {};
     if (file.upstream_etag) headers["If-None-Match"] = file.upstream_etag;
     if (file.upstream_last_modified) headers["If-Modified-Since"] = file.upstream_last_modified;
 
-    const res = await fetchOfficialPdf(file.source_url, headers);
+    const res = await fetchOfficialPdf(env, file.source_url, headers);
     // We only need the status; releasing the body keeps the subrequest from being held open.
     await res.body?.cancel().catch(() => {});
 
@@ -207,14 +207,14 @@ export async function runDiscovery(
   let pageEtag: string | null = null;
   let pageLastModified: string | null = null;
   try {
-    const first = await fetchPageApi(pageApiUrl, {
+    const first = await fetchPageApi(env, pageApiUrl, {
       etag: previousManifest?.source.etag,
       lastModified: previousManifest?.source.last_modified,
     });
 
     if (first.notModified) {
       if (!options.force && previousManifest) {
-        if (!(await anyPreviousPdfChanged(previousManifest))) {
+        if (!(await anyPreviousPdfChanged(env, previousManifest))) {
           return {
             outcome: "unchanged",
             previous_snapshot_id: previousPointer?.snapshot_id ?? null,
@@ -223,7 +223,7 @@ export async function runDiscovery(
         }
       }
       // Something moved (or a forced run): we need the full body to rebuild the catalogue.
-      const full = await fetchPageApi(pageApiUrl);
+      const full = await fetchPageApi(env, pageApiUrl);
       if (full.notModified || !full.bytes) {
         return { outcome: "error", error: "Page API answered 304 to an unconditional request" };
       }
@@ -282,7 +282,7 @@ export async function runDiscovery(
 
     if (pageUnchanged && catalogueUnchanged) {
       try {
-        if (!(await anyPreviousPdfChanged(previousManifest))) {
+        if (!(await anyPreviousPdfChanged(env, previousManifest))) {
           return {
             outcome: "unchanged",
             previous_snapshot_id: previousPointer.snapshot_id,
@@ -473,7 +473,7 @@ export async function runPdfIngest(env: Env, job: IngestPdfJob): Promise<IngestR
 
   let response: Response;
   try {
-    response = await fetchOfficialPdf(job.source_url);
+    response = await fetchOfficialPdf(env, job.source_url);
   } catch (err) {
     return {
       outcome: "error",
@@ -770,8 +770,12 @@ export async function runFinalize(env: Env, snapshotId: string): Promise<Finaliz
  */
 export async function runReconcile(env: Env): Promise<ReconcileResult> {
   let listing;
+  let current;
   try {
-    listing = await env.R2_BUCKET.list({ prefix: PENDING_PREFIX, delimiter: "/", limit: 100 });
+    [listing, current] = await Promise.all([
+      env.R2_BUCKET.list({ prefix: PENDING_PREFIX, delimiter: "/", limit: 100 }),
+      env.R2_BUCKET.head(CURRENT_KEY),
+    ]);
   } catch (err) {
     return {
       outcome: "error",
@@ -805,6 +809,11 @@ export async function runReconcile(env: Env): Promise<ReconcileResult> {
     }
     const descriptor = await readDescriptor(env, snapshotId);
     if (!descriptor) continue;
+
+    // A descriptor can only win the CAS while current.json still has exactly the ETag it observed
+    // at discovery. Once that changes, fetching its missing PDFs would create load for a snapshot
+    // that is already provably superseded, so leave it as harmless immutable history.
+    if (descriptor.current_etag !== (current?.etag ?? null)) continue;
 
     const pending: { body: PublicationJob }[] = [];
     for (const file of descriptor.files) {
