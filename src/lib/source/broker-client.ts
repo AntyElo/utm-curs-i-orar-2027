@@ -473,19 +473,14 @@ export function generateAcceptedId(
 }
 
 /**
- * Fetch durable accepted schedule from the broker via split architecture:
- * 1. GET small pointer from /accepted/course-:courseYear
- * 2. GET immutable payload from /accepted-payloads/course-:courseYear/:acceptedId
- * 3. Verify payload SHA-256 and metadata consistency
+ * Fetch accepted pointer for a course from the broker.
  */
-export async function fetchAcceptedSchedule(
+export async function fetchAcceptedPointer(
   courseYear: number,
   options: BrokerDeadlineOptions = {},
-): Promise<AcceptedRecord | null> {
+): Promise<AcceptedPointer | null> {
   if (!config.brokerUrl) return null;
   const pointerUrl = resolveUrl(`/accepted/course-${courseYear}`);
-
-  /** Each request gets what is left of the caller's budget, not a fresh copy of it. */
   const budget = () => remainingBudgetMs(options);
 
   try {
@@ -494,7 +489,6 @@ export async function fetchAcceptedSchedule(
       return null;
     }
 
-    // 1. Fetch small pointer
     const pointerRes = await fetchBrokerBounded(
       pointerUrl,
       { method: "GET", headers: { Accept: "application/json" } },
@@ -526,6 +520,32 @@ export async function fetchAcceptedSchedule(
       return null;
     }
 
+    return pointer;
+  } catch (error) {
+    log.warn("failed to fetch accepted pointer from broker", { courseYear, error: errorMessage(error) });
+    return null;
+  }
+}
+
+/**
+ * Fetch durable accepted schedule from the broker via split architecture:
+ * 1. GET small pointer from /accepted/course-:courseYear
+ * 2. GET immutable payload from /accepted-payloads/course-:courseYear/:acceptedId
+ * 3. Verify payload SHA-256 and metadata consistency
+ */
+export async function fetchAcceptedSchedule(
+  courseYear: number,
+  options: BrokerDeadlineOptions = {},
+): Promise<AcceptedRecord | null> {
+  if (!config.brokerUrl) return null;
+
+  const pointer = await fetchAcceptedPointer(courseYear, options);
+  if (!pointer) return null;
+
+  /** Each request gets what is left of the caller's budget, not a fresh copy of it. */
+  const budget = () => remainingBudgetMs(options);
+
+  try {
     // 2. Fetch immutable payload
     validatePathToken(pointer.accepted_id, "accepted_id");
     if (budget() <= 0) {

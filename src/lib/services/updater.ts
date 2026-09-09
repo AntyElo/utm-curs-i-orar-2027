@@ -26,6 +26,7 @@ import {
 } from "@/lib/source/downloader";
 import { splitPdfRevision } from "@/lib/source/revision";
 import {
+  fetchAcceptedPointer,
   fetchAcceptedSchedule,
   fetchCandidatePdf,
   fetchCurrentPointer,
@@ -385,7 +386,11 @@ async function runBrokerAutomaticCheck(
 
   // CRITICAL TRANSACTION ORDERING (Section 13):
   // 1. Write durable accepted state to R2 with CAS FIRST
-  const expectedPreviousAcceptedId = durableAccepted?.accepted_id ?? null;
+  let expectedPreviousAcceptedId = durableAccepted?.accepted_id ?? null;
+  if (!expectedPreviousAcceptedId && config.brokerUrl) {
+    const existingPointer = await fetchAcceptedPointer(courseYear, { timeoutMs: config.brokerTimeoutMs });
+    expectedPreviousAcceptedId = existingPointer?.accepted_id ?? null;
+  }
   const putResult = await putAcceptedSchedule(
     courseYear,
     expectedPreviousAcceptedId,
