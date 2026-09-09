@@ -220,18 +220,48 @@ Page API redirect or other deterministic failure is still an
 error — the previous `current.json` is left exactly as it was. Only a genuine 304 (or an unchanged
 `modified_gmt` with an unchanged catalogue and unchanged PDFs) means "unchanged".
 
-### Accepted state
+### Accepted state and durable transaction ordering
 
 Accepted state — what Render actually parsed and validated — is stored in two pieces so the Worker
 never has to hold a ~200 KB Schedule in memory: an immutable payload streamed straight into R2
-under a content-addressed id, and a small compare-and-swapped pointer that names it. The pointer is
-written only after the payload exists and only if every field agrees with the payload's own stored
-metadata, and `Content-Length` is treated as a hint — the size limit is enforced on the counted
-bytes of the stream, so a chunked upload cannot exceed it.
+under a content-addressed id (`accepted-payloads/course-:year/:acceptedId`), and a small
+compare-and-swapped pointer that names it (`accepted/course-:year`). The pointer is written only
+after the payload exists and only if every field agrees with the payload's own stored metadata, and
+`Content-Length` is treated as a hint — the size limit is enforced on the counted bytes of the
+stream, so a chunked upload cannot exceed it.
+
+The broker enforces strict transaction ordering during candidate reconciliation:
+1. Render parses and validates the candidate PDF against domain rules.
+2. Render writes the immutable payload to R2 first (`PUT /accepted-payloads/course-:year/:acceptedId`).
+3. Render writes the pointer with compare-and-swap (`PUT /accepted/course-:year` with `expected_previous_accepted_id`).
+4. Only after the durable CAS write succeeds does Render replace its local `current_schedule.json` and `metadata.json`. If the durable write fails or conflicts, local state remains untouched.
 
 The broker's supported course years live in one list (`worker/src/courses.ts`) and every accepted
 route re-checks against it: `course-0`, `course-3`, `course-99` and `course-01` are all refused
 rather than coerced by `parseInt`.
+
+### Bounded retention, 6-hour lifetime and maintenance cursors
+
+The broker implements bounded, fail-closed retention and garbage collection to operate safely within Free-tier limits:
+- **6-hour publication lifetime:** Snapshots in `pending/` older than 6 hours (`PENDING_MAX_AGE_MS = 6 * 60 * 60 * 1000`) are considered expired; reconciliation stops re-enqueuing jobs for them.
+- **24-hour retention threshold:** Objects in `snapshots/` older than 24 hours (`RETENTION_AGE_MS = 24 * 60 * 60 * 1000`) become eligible for garbage collection.
+- **Protected snapshots:** Mark-and-sweep GC strictly protects the currently referenced `current.json` snapshot plus its immediate predecessor chain (`SNAPSHOT_KEEP_PREDECESSORS = 2`). Live data can never be deleted.
+- **Maintenance cursors:** Pagination state is maintained in durable R2 cursors (`maintenance/reconcile.json`, `maintenance/gc-pending.json`, `maintenance/gc-snapshots.json`). Sweeps are strictly bounded (`GC_PREFIXES_PER_NAMESPACE = 8`, `GC_MAX_PREFIX_DELETIONS = 4`, `GC_MAX_OBJECTS_PER_PREFIX = 64`, `RECONCILE_SCAN_PAGES = 3`). Cursors are hints; sweeps are strongly consistent and idempotent.
+
+### Degraded mode and upstream 403 behaviour
+
+FCIM upstream Cloudflare challenge responses (HTTP 403), rate limits (HTTP 429), or server errors do not compromise system invariants:
+- Publication jobs retry up to 3 times before routing to the DLQ.
+- An upstream failure never clears `current.json` or mutates existing candidate snapshots.
+- Durable accepted state and local schedules are never deleted or corrupted by upstream outages.
+- Render continues serving verified last-known-good schedules from local disk or durable accepted broker state, with fallback to verified bundled seeds during cold starts.
+
+### Production cutover and rollback semantics
+
+The cutover from direct FCIM transport to the broker architecture is designed for zero-downtime, single-instance Render execution:
+- **Master activation switch:** `SCHEDULE_BROKER_URL` governs transport selection. When unset, the application executes pre-broker direct transport.
+- **Safe rollout order:** Cloudflare infrastructure and worker secrets are aligned before activating the broker on Render.
+- **Instant non-destructive rollback:** If an anomaly occurs, unsetting `SCHEDULE_BROKER_URL` on Render immediately reverts the application to direct transport and seed fallbacks without modifying Git history or destroying durable R2 state.
 
 ## Odd / even weeks
 
