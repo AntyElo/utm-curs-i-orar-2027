@@ -20,7 +20,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { config } from "@/lib/config";
 import type { AcceptedPointer, CurrentPointer, Schedule, SnapshotManifest } from "@/lib/models";
 import { parsePdf, sha256 } from "@/lib/parser";
@@ -36,8 +36,46 @@ import {
 } from "../worker/src/keys";
 import { createHarness, type WorkerHarness } from "./helpers/worker-doubles";
 
+/**
+ * Every local installation the production storage layer performs, in order.
+ *
+ * Final-state assertions alone cannot tell "the tampered accepted payload was never trusted"
+ * apart from "it was installed and then overwritten by the valid candidate a moment later" —
+ * both end with revision 18 on disk. Recording the real `replaceCurrentSchedule()` calls makes
+ * the whole sequence observable, so a transient install is a visible extra entry. The wrapper
+ * delegates to the real implementation: production storage behaviour is observed, not replaced.
+ */
+const { installLog } = vi.hoisted(() => ({
+  installLog: [] as Array<{ course_year: number; source_pdf_hash: string; warnings: string[] }>,
+}));
+
+vi.mock("@/lib/storage", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/storage")>();
+  return {
+    ...actual,
+    replaceCurrentSchedule: async (courseYear: number, schedule: Schedule): Promise<void> => {
+      installLog.push({
+        course_year: courseYear,
+        source_pdf_hash: schedule.metadata.source_pdf_hash,
+        warnings: [...schedule.warnings],
+      });
+      return actual.replaceCurrentSchedule(courseYear, schedule);
+    },
+  };
+});
+
 const BROKER_URL = "https://broker.fcim.internal";
 const BROKER_SECRET = "gate-f-broker-secret";
+
+/**
+ * Candidate selection runs the production `discoverPdf()` against the real wall clock, and the
+ * page-api fixture below describes the autumn 2026/2027 semester. Pin the clock inside the
+ * fixture's own academic year so the suite cannot start failing when the host calendar rolls
+ * over — the same `useFakeTimers` / `setSystemTime` pairing the other discovery-driven suites
+ * use. Only `Date` is faked: these tests await real network-shaped I/O and PDF parsing, and a
+ * frozen `setTimeout` would stall the broker client's own timeout plumbing.
+ */
+const PINNED_NOW = new Date("2026-09-09T12:00:00.000Z");
 
 const SNAPSHOT_ACCEPTED = "2026-09-08T01-00-00-000Z-9f8e7d6c";
 const SNAPSHOT_CANDIDATE = "2026-09-08T02-30-00-000Z-1a2b3c4d";
@@ -48,6 +86,9 @@ const URL_R16 = `${UPLOADS}/anul_i_semestrul_i-16.pdf`;
 const URL_R18 = `${UPLOADS}/anul_i_semestrul_i-18.pdf`;
 
 const POINTER_PATH = "/accepted/course-1";
+
+/** Carried only by the SHA-invalid payload, so any install of it is unmistakable. */
+const TAMPER_MARKER = "tampered-after-pointer-write";
 
 interface CasWrite {
   expected_previous_accepted_id: string | null;
@@ -79,6 +120,10 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
   const originalFetch = globalThis.fetch;
 
   beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(PINNED_NOW);
+    installLog.length = 0;
+
     tempDir = await mkdtemp(path.join(tmpdir(), "fcim-fallback-test-"));
     (config as { dataDir: string }).dataDir = tempDir;
     (config as { brokerUrl: string }).brokerUrl = BROKER_URL;
@@ -99,6 +144,8 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
   });
 
   afterEach(async () => {
+    // First, so a pinned clock can never leak into another suite even if cleanup below throws.
+    vi.useRealTimers();
     globalThis.fetch = originalFetch;
     (config as { dataDir: string }).dataDir = originalDataDir;
     (config as { brokerUrl: string }).brokerUrl = originalBrokerUrl;
@@ -254,7 +301,14 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
   async function installLocalR9(): Promise<Schedule> {
     const schedule = await makeSchedule(pdfBytes9, URL_R9, SNAPSHOT_ACCEPTED);
     await replaceCurrentSchedule(1, schedule);
+    // Drop the fixture write: from here on the log is exactly what the updater installed.
+    installLog.length = 0;
     return schedule;
+  }
+
+  /** Every hash the production storage layer was asked to install, in order. */
+  function installedHashes(): string[] {
+    return installLog.map((entry) => entry.source_pdf_hash);
   }
 
   /** The durable accepted state whose payload is unusable: revision 16. */
@@ -299,10 +353,12 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
     expect(after!.source_pdf_hash).toBe(hash18);
     expect(harness.bucket.has(after!.payload_key)).toBe(true);
 
-    // Local install happened only after the durable write, and installed C — never A.
+    // Exactly one local install across the whole run, and it is C — A was never installed,
+    // not even transiently.
+    expect(installedHashes()).toEqual([hash18]);
+
     const local = await getCurrentSchedule(1);
     expect(local?.metadata.source_pdf_hash).toBe(hash18);
-    expect(local?.metadata.source_pdf_hash).not.toBe(hash16);
 
     const state = await getSourceState(1);
     expect(state.last_result).toBe("updated");
@@ -319,7 +375,7 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
     // The payload is present and parseable, but its bytes disagree with pointer.payload_sha256.
     const tamperedA: Schedule = {
       ...scheduleA,
-      warnings: [...scheduleA.warnings, "tampered-after-pointer-write"],
+      warnings: [...scheduleA.warnings, TAMPER_MARKER],
     };
     seedPointer(pointerA);
     seedPayload(pointerA, JSON.stringify(tamperedA));
@@ -338,11 +394,19 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
     expect(after!.accepted_id).not.toBe(pointerA.accepted_id);
     expect(after!.source_pdf_hash).toBe(hash18);
 
-    // The untrusted payload was never installed locally, before or after the durable write.
+    // GF-F02: the whole installation sequence, not just where it ended up. Exactly one install,
+    // and it is the candidate. A transient install of the SHA-invalid payload — which the
+    // candidate would then overwrite, leaving final state indistinguishable — is an extra entry
+    // here and fails the test.
+    expect(installedHashes()).toEqual([hash18]);
+    expect(installedHashes()).not.toContain(hash16);
+    for (const entry of installLog) {
+      expect(entry.warnings).not.toContain(TAMPER_MARKER);
+    }
+
     const local = await getCurrentSchedule(1);
     expect(local?.metadata.source_pdf_hash).toBe(hash18);
-    expect(local?.metadata.source_pdf_hash).not.toBe(hash16);
-    expect(local?.warnings).not.toContain("tampered-after-pointer-write");
+    expect(local?.warnings).not.toContain(TAMPER_MARKER);
   });
 
   /* ------------------------------- Case 3 ------------------------------- */
@@ -384,11 +448,11 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
     expect(after!.accepted_id).toBe(pointerB.accepted_id);
     expect(after!.source_pdf_hash).toBe(hash9);
 
-    // Local last-known-good is untouched.
+    // Local last-known-good is untouched: the storage layer was never asked to install anything.
+    expect(installedHashes()).toEqual([]);
     const local = await getCurrentSchedule(1);
     expect(local?.metadata.source_pdf_hash).toBe(localBefore.metadata.source_pdf_hash);
     expect(local?.metadata.source_pdf_hash).toBe(hash9);
-    expect(local?.metadata.source_pdf_hash).not.toBe(hash18);
 
     const state = await getSourceState(1);
     expect(state.last_result).toBe("error");
@@ -428,6 +492,7 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
     const after = storedPointer();
     expect(after!.accepted_id).toBe(pointerA.accepted_id);
 
+    expect(installedHashes()).toEqual([]);
     const local = await getCurrentSchedule(1);
     expect(local?.metadata.source_pdf_hash).toBe(localBefore.metadata.source_pdf_hash);
     expect(local?.metadata.source_pdf_hash).not.toBe(hash18);
@@ -456,6 +521,7 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
     expect(after!.source_pdf_hash).toBe(hash18);
     expect(harness.bucket.has(after!.payload_key)).toBe(true);
 
+    expect(installedHashes()).toEqual([hash18]);
     const local = await getCurrentSchedule(1);
     expect(local?.metadata.source_pdf_hash).toBe(hash18);
 
@@ -493,6 +559,8 @@ describe("broker accepted-pointer CAS fallback (ac75d22)", () => {
     expect(result.outcome).toBe("updated");
     expect(localHashResolved).toBe(true);
     expect(localHashAtCasTime).toBe(hash9);
+    // Nothing had been installed yet when the CAS write went out; C followed, and only C.
+    expect(installedHashes()).toEqual([hash18]);
     expect((await getCurrentSchedule(1))?.metadata.source_pdf_hash).toBe(hash18);
   });
 });
