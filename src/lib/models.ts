@@ -139,11 +139,21 @@ export const SnapshotManifestSchema = z.object({
 });
 export type SnapshotManifest = z.infer<typeof SnapshotManifestSchema>;
 
+/**
+ * The broker's `current.json`. The broker validates this document far more strictly than we do —
+ * it is the one object that decides which snapshot may be served, so it enforces an exact field
+ * set on write. Here we only require what Render actually consumes, and treat the publication
+ * bookkeeping fields as informational.
+ */
 export const CurrentPointerSchema = z.object({
   schema_version: z.literal(1).default(1),
   snapshot_id: z.string(),
   updated_at: z.string(),
   manifest_r2_key: z.string(),
+  published_at: z.string().optional(),
+  page_modified_gmt: z.string().nullable().optional(),
+  page_id: z.number().nullable().optional(),
+  pdf_count: z.number().int().nonnegative().optional(),
 });
 export type CurrentPointer = z.infer<typeof CurrentPointerSchema>;
 

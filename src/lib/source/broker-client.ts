@@ -39,6 +39,25 @@ const TRAVERSAL_PATTERN = /(?:%25|%2e|%2f|%5c|\.\.|\\)/i;
 const SAFE_TOKEN_PATTERN = /^[a-zA-Z0-9._-]+$/;
 
 /**
+ * A caller that is itself working against a wall-clock deadline passes it down here, so a
+ * multi-request operation spends the budget it was given rather than `timeoutMs` per request.
+ */
+export interface BrokerDeadlineOptions {
+  timeoutMs?: number;
+  /** Absolute epoch-ms deadline shared by every step of the calling operation. */
+  deadlineAt?: number;
+  /** Aborts every in-flight request the moment that deadline passes. */
+  signal?: AbortSignal;
+}
+
+/** Milliseconds still available: the smaller of the per-request timeout and the shared deadline. */
+export function remainingBudgetMs(options: BrokerDeadlineOptions): number {
+  const perRequest = options.timeoutMs ?? config.brokerTimeoutMs;
+  if (options.deadlineAt === undefined) return perRequest;
+  return Math.min(perRequest, options.deadlineAt - Date.now());
+}
+
+/**
  * Validate that a URL path token (snapshot ID, accepted ID, etc.) contains no traversal or forbidden characters.
  */
 export function validatePathToken(token: string, name = "token"): string {
@@ -63,9 +82,50 @@ export function validatePdfFilename(filename: string): string {
 }
 
 /**
- * Parse and validate SCHEDULE_BROKER_URL as a single fixed HTTPS origin without credentials, query, or fragment.
+ * Every broker URL is exactly `https://HOST`, optionally with one trailing slash.
+ * `new URL()` will not tell you that: it happily reports `https://host/a/../` as pathname `/`,
+ * which is why the raw configured string is inspected first.
+ */
+const BROKER_ORIGIN_PATTERN =
+  /^https:\/\/[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*\/?$/;
+
+/**
+ * Parse and validate SCHEDULE_BROKER_URL as a single fixed HTTPS origin without credentials,
+ * port, path, query or fragment.
+ *
+ * Validation happens on the raw configured value *before* URL normalisation. `new URL()`
+ * resolves `https://broker.example/..` to pathname `/`, so a check that ran after parsing would
+ * accept a value whose text says something else entirely; percent-encoded and doubly-encoded
+ * traversal is rejected here for the same reason.
  */
 export function parseAndValidateBrokerUrl(rawUrl: string): URL {
+  if (typeof rawUrl !== "string" || rawUrl.length === 0) {
+    throw new Error("SCHEDULE_BROKER_URL is not configured");
+  }
+
+  // --- Raw-text rules, all applied before the string is ever normalised. ---
+  if (TRAVERSAL_PATTERN.test(rawUrl)) {
+    throw new Error(`SCHEDULE_BROKER_URL must not contain path traversal: ${rawUrl}`);
+  }
+  if (!rawUrl.startsWith("https://")) {
+    const scheme = rawUrl.slice(0, Math.max(rawUrl.indexOf(":") + 1, 1));
+    throw new Error(`SCHEDULE_BROKER_URL must use https: protocol, got ${scheme || rawUrl}`);
+  }
+  const authorityAndRest = rawUrl.slice("https://".length);
+  if (authorityAndRest.includes("@")) {
+    throw new Error("SCHEDULE_BROKER_URL must not contain credentials");
+  }
+  if (authorityAndRest.includes("?") || authorityAndRest.includes("#")) {
+    throw new Error("SCHEDULE_BROKER_URL must not contain query parameters or fragments");
+  }
+  if (authorityAndRest.includes(":")) {
+    throw new Error("SCHEDULE_BROKER_URL must not specify a port");
+  }
+  if (!BROKER_ORIGIN_PATTERN.test(rawUrl)) {
+    throw new Error("SCHEDULE_BROKER_URL must be origin only");
+  }
+
+  // --- Same rules again on the parsed URL, so neither layer can be the only one. ---
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -77,6 +137,9 @@ export function parseAndValidateBrokerUrl(rawUrl: string): URL {
   }
   if (url.username || url.password) {
     throw new Error("SCHEDULE_BROKER_URL must not contain credentials");
+  }
+  if (url.port) {
+    throw new Error("SCHEDULE_BROKER_URL must not specify a port");
   }
   if (url.hash || url.search) {
     throw new Error("SCHEDULE_BROKER_URL must not contain query parameters or fragments");
@@ -172,15 +235,24 @@ export async function readStreamWithLimit(
 /**
  * Hardened HTTP fetch where one deadline covers connect, headers, AND full body consumption.
  * Redirects are blocked (redirect: "error").
+ *
+ * An outer `signal` — the caller's own wall-clock deadline — aborts this request too, so a
+ * per-request timeout can never outlive the budget the caller was given.
  */
 export async function fetchBrokerBounded(
   url: string,
   init: RequestInit = {},
   maxBytes: number,
   timeoutMs: number = config.brokerTimeoutMs,
+  outerSignal?: AbortSignal,
 ): Promise<{ status: number; headers: Headers; bytes: Uint8Array }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const abortFromOuter = () => controller.abort();
+  if (outerSignal) {
+    if (outerSignal.aborted) controller.abort();
+    else outerSignal.addEventListener("abort", abortFromOuter, { once: true });
+  }
 
   try {
     const response = await fetch(url, {
@@ -210,6 +282,7 @@ export async function fetchBrokerBounded(
     throw new SourceFetchError(`Broker network error for ${url}: ${errorMessage(error)}`, "network");
   } finally {
     clearTimeout(timer);
+    outerSignal?.removeEventListener("abort", abortFromOuter);
   }
 }
 
@@ -407,18 +480,27 @@ export function generateAcceptedId(
  */
 export async function fetchAcceptedSchedule(
   courseYear: number,
-  options: { timeoutMs?: number } = {},
+  options: BrokerDeadlineOptions = {},
 ): Promise<AcceptedRecord | null> {
   if (!config.brokerUrl) return null;
   const pointerUrl = resolveUrl(`/accepted/course-${courseYear}`);
 
+  /** Each request gets what is left of the caller's budget, not a fresh copy of it. */
+  const budget = () => remainingBudgetMs(options);
+
   try {
+    if (budget() <= 0) {
+      log.warn("broker accepted-state fetch skipped: no time left in the caller's deadline", { courseYear });
+      return null;
+    }
+
     // 1. Fetch small pointer
     const pointerRes = await fetchBrokerBounded(
       pointerUrl,
       { method: "GET", headers: { Accept: "application/json" } },
       64 * 1024,
-      options.timeoutMs ?? config.brokerTimeoutMs,
+      budget(),
+      options.signal,
     );
 
     if (pointerRes.status === 404) return null;
@@ -446,12 +528,17 @@ export async function fetchAcceptedSchedule(
 
     // 2. Fetch immutable payload
     validatePathToken(pointer.accepted_id, "accepted_id");
+    if (budget() <= 0) {
+      log.warn("broker accepted-payload fetch abandoned: caller's deadline elapsed", { courseYear });
+      return null;
+    }
     const payloadUrl = resolveUrl(`/accepted-payloads/course-${courseYear}/${pointer.accepted_id}`);
     const payloadRes = await fetchBrokerBounded(
       payloadUrl,
       { method: "GET", headers: { Accept: "application/json" } },
       5 * 1024 * 1024,
-      options.timeoutMs ?? config.brokerTimeoutMs,
+      budget(),
+      options.signal,
     );
 
     if (payloadRes.status !== 200) {
@@ -460,6 +547,11 @@ export async function fetchAcceptedSchedule(
         acceptedId: pointer.accepted_id,
         status: payloadRes.status,
       });
+      return null;
+    }
+
+    if (budget() <= 0) {
+      log.warn("broker accepted-payload validation abandoned: caller's deadline elapsed", { courseYear });
       return null;
     }
 
@@ -559,6 +651,9 @@ export async function putAcceptedSchedule(
     record.accepted_id ??
     generateAcceptedId(record.source_pdf_hash, parserVersion, payloadSha256);
   validatePathToken(acceptedId, "accepted_id");
+  // One instant for both the payload metadata and the pointer: the broker cross-checks them,
+  // and two `new Date()` calls would occasionally disagree by a millisecond.
+  const acceptedAt = record.accepted_at ?? new Date().toISOString();
 
   // Step 1: Upload immutable payload
   const payloadUrl = resolveUrl(`/accepted-payloads/course-${courseYear}/${acceptedId}`);
@@ -567,9 +662,11 @@ export async function putAcceptedSchedule(
     "Content-Length": String(payloadBytes.byteLength),
     "x-course-year": String(courseYear),
     "x-source-pdf-hash": record.source_pdf_hash,
+    "x-source-pdf-url": record.source_pdf_url,
     "x-payload-sha256": payloadSha256,
     "x-snapshot-id": record.snapshot_id,
     "x-parser-version": parserVersion,
+    "x-accepted-at": acceptedAt,
   };
   if (config.brokerSecret) {
     payloadHeaders.Authorization = `Bearer ${config.brokerSecret}`;
@@ -617,7 +714,7 @@ export async function putAcceptedSchedule(
     source_pdf_url: record.source_pdf_url,
     source_pdf_hash: record.source_pdf_hash,
     parser_version: parserVersion,
-    accepted_at: record.accepted_at ?? new Date().toISOString(),
+    accepted_at: acceptedAt,
   };
 
   const pointerBody = JSON.stringify({

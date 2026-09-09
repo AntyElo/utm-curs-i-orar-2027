@@ -22,3 +22,8 @@ debug/
 tmp/
 out/
 .wrangler/
+
+# Cloudflare Worker local secrets
+.dev.vars
+.dev.vars.*
+

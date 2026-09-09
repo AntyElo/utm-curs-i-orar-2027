@@ -9,6 +9,7 @@
 import { readFile } from "node:fs/promises";
 import { config } from "@/lib/config";
 import { isSupportedCourse, courseSeed, SUPPORTED_COURSE_YEARS, UnsupportedCourseError, type CourseSeed } from "@/lib/courses";
+import { Deadline, DeadlineExceededError } from "@/lib/deadline";
 import { errorMessage, getLogger } from "@/lib/logger";
 import type { Schedule, ScheduleMetadata, SourceState } from "@/lib/models";
 import { parsePdf, sha256, type Provenance } from "@/lib/parser";
@@ -1028,89 +1029,136 @@ async function seedFromBundledPdf(courseYear: number): Promise<CheckResult> {
 }
 
 /**
+ * Parsing a bundled seed is CPU-bound, and CPU-bound work cannot be preempted by a timer: once
+ * `parsePdf` starts, the deadline can only be observed after it returns. So the seed fallback is
+ * gated on having enough budget to plausibly finish, rather than merely on the deadline not having
+ * passed yet. A course skipped here is picked up by the first scheduler tick instead.
+ */
+const MIN_SEED_RESTORE_BUDGET_MS = 1_500;
+
+/**
+ * Restore one course's state under a shared deadline.
+ *
+ * Every step — the local read, the broker pointer, the broker payload, the local write and the
+ * seed fallback — is either given the remaining budget or raced against it, so no single stalled
+ * operation can push the caller past `totalTimeoutMs`.
+ */
+async function restoreCourseOnColdStart(courseYear: number, deadline: Deadline): Promise<void> {
+  const existing = await deadline.race(getCurrentSchedule(courseYear));
+  if (existing) {
+    log.info("cold-start bootstrap: local schedule already present", { courseYear });
+    return;
+  }
+
+  let restoredFromBroker = false;
+
+  if (config.brokerUrl && !deadline.expired) {
+    try {
+      const accepted = await fetchAcceptedSchedule(courseYear, {
+        timeoutMs: config.brokerTimeoutMs,
+        deadlineAt: deadline.deadlineAt,
+        signal: deadline.signal,
+      });
+
+      if (accepted && accepted.schedule) {
+        const mismatch = courseYearMismatch(accepted.schedule, courseYear);
+        if (mismatch) {
+          log.warn("cold-start bootstrap: broker accepted schedule rejected due to course year mismatch", {
+            courseYear,
+            mismatch,
+          });
+        } else {
+          await deadline.race(replaceCurrentSchedule(courseYear, accepted.schedule));
+          await deadline.race(
+            saveSourceState(courseYear, {
+              current_pdf_url: accepted.source_pdf_url,
+              current_pdf_hash: accepted.source_pdf_hash,
+              etag: accepted.schedule.metadata.etag,
+              last_modified: accepted.schedule.metadata.last_modified,
+              last_success_at: accepted.accepted_at,
+              last_result: "updated",
+              academic_year: accepted.schedule.metadata.academic_year,
+              semester: accepted.schedule.metadata.semester,
+            }),
+          );
+          log.info("cold-start bootstrap: restored schedule from broker durable accepted state", {
+            courseYear,
+            hash: accepted.source_pdf_hash,
+            lessons: accepted.schedule.lessons.length,
+          });
+          restoredFromBroker = true;
+        }
+      }
+    } catch (brokerError) {
+      if (brokerError instanceof DeadlineExceededError) throw brokerError;
+      log.warn("cold-start bootstrap: broker restoration failed", {
+        courseYear,
+        error: errorMessage(brokerError),
+      });
+    }
+  }
+
+  if (restoredFromBroker) return;
+
+  if (deadline.remaining() < MIN_SEED_RESTORE_BUDGET_MS) {
+    log.warn("cold-start bootstrap: not enough budget left for bundled seed restoration", {
+      courseYear,
+      remainingMs: deadline.remaining(),
+      requiredMs: MIN_SEED_RESTORE_BUDGET_MS,
+    });
+    return;
+  }
+
+  try {
+    await deadline.race(seedFromBundledPdf(courseYear));
+    log.info("cold-start bootstrap: restored bundled seed", { courseYear });
+  } catch (seedError) {
+    if (seedError instanceof DeadlineExceededError) throw seedError;
+    log.warn("cold-start bootstrap: bundled seed restoration failed", {
+      courseYear,
+      error: errorMessage(seedError),
+    });
+  }
+}
+
+/**
  * Cold-start bootstrap: bounded restoration of initial schedule state before candidate validation.
  *
- * Runs supported courses concurrently under one shared global timeout deadline.
- * - If local accepted schedule exists: keep it.
- * - If local state is absent:
- *   - If broker is configured: attempt to fetch durable accepted schedule GET /accepted/course-N
- *     - Validate schema, course guard, and atomically restore local state.
- *   - If broker unavailable, 404, or invalid: restore bundled seed as last resort.
+ * Runs supported courses concurrently under one shared wall-clock deadline: `totalTimeoutMs` is
+ * measured from the moment bootstrap starts, and every operation underneath receives what is left
+ * of it. A course whose broker pointer or payload stalls is abandoned at the deadline instead of
+ * holding startup open, and the other courses still get their own restoration.
+ *
+ * - If a local accepted schedule exists: keep it.
+ * - Otherwise, if the broker is configured: restore the durable accepted state for the course
+ *   (schema-validated, course-guarded, atomically installed).
+ * - If the broker is unavailable, 404s, returns something invalid, or there is no budget left:
+ *   fall back to the bundled seed.
  */
 export async function bootstrapScheduleState(options: { totalTimeoutMs?: number } = {}): Promise<void> {
-  const totalTimeoutMs = options.totalTimeoutMs ?? (config.brokerTimeoutMs * 2);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), totalTimeoutMs);
+  const totalTimeoutMs = options.totalTimeoutMs ?? config.brokerTimeoutMs * 2;
+  const deadline = new Deadline(totalTimeoutMs);
 
   try {
     await Promise.allSettled(
       SUPPORTED_COURSE_YEARS.map(async (courseYear) => {
         try {
-          const existing = await getCurrentSchedule(courseYear);
-          if (existing) {
-            log.info("cold-start bootstrap: local schedule already present", { courseYear });
+          await restoreCourseOnColdStart(courseYear, deadline);
+        } catch (error) {
+          if (error instanceof DeadlineExceededError) {
+            log.warn("cold-start bootstrap: total deadline elapsed before this course finished", {
+              courseYear,
+              totalTimeoutMs,
+              elapsedMs: deadline.elapsed(),
+            });
             return;
           }
-
-          let restoredFromBroker = false;
-          if (config.brokerUrl && !controller.signal.aborted) {
-            try {
-              const accepted = await fetchAcceptedSchedule(courseYear, {
-                timeoutMs: Math.min(config.brokerTimeoutMs, totalTimeoutMs),
-              });
-              if (accepted && accepted.schedule) {
-                const mismatch = courseYearMismatch(accepted.schedule, courseYear);
-                if (!mismatch) {
-                  await replaceCurrentSchedule(courseYear, accepted.schedule);
-                  await saveSourceState(courseYear, {
-                    current_pdf_url: accepted.source_pdf_url,
-                    current_pdf_hash: accepted.source_pdf_hash,
-                    etag: accepted.schedule.metadata.etag,
-                    last_modified: accepted.schedule.metadata.last_modified,
-                    last_success_at: accepted.accepted_at,
-                    last_result: "updated",
-                    academic_year: accepted.schedule.metadata.academic_year,
-                    semester: accepted.schedule.metadata.semester,
-                  });
-                  log.info("cold-start bootstrap: restored schedule from broker durable accepted state", {
-                    courseYear,
-                    hash: accepted.source_pdf_hash,
-                    lessons: accepted.schedule.lessons.length,
-                  });
-                  restoredFromBroker = true;
-                } else {
-                  log.warn("cold-start bootstrap: broker accepted schedule rejected due to course year mismatch", {
-                    courseYear,
-                    mismatch,
-                  });
-                }
-              }
-            } catch (brokerError) {
-              log.warn("cold-start bootstrap: broker restoration failed", {
-                courseYear,
-                error: errorMessage(brokerError),
-              });
-            }
-          }
-
-          if (!restoredFromBroker) {
-            try {
-              await seedFromBundledPdf(courseYear);
-              log.info("cold-start bootstrap: restored bundled seed", { courseYear });
-            } catch (seedError) {
-              log.warn("cold-start bootstrap: bundled seed restoration failed", {
-                courseYear,
-                error: errorMessage(seedError),
-              });
-            }
-          }
-        } catch (error) {
           log.error("cold-start bootstrap failed for course", { courseYear, error: errorMessage(error) });
         }
       }),
     );
   } finally {
-    clearTimeout(timer);
+    deadline.dispose();
   }
 }
 

@@ -447,6 +447,42 @@ describe("Audit E-05: Broker URL security parsing & path token validators", () =
     );
   });
 
+  it("rejects traversal in the raw value that URL normalisation would erase", () => {
+    // `new URL()` reports pathname "/" for every one of these, which is exactly why the raw
+    // configured string has to be inspected before it is parsed.
+    const normalisedAway = [
+      "https://broker.fcim.internal/..",
+      "https://broker.fcim.internal/../",
+      "https://broker.fcim.internal/a/../",
+      "https://broker.fcim.internal/%2e%2e",
+      "https://broker.fcim.internal/%2E%2E/",
+      "https://broker.fcim.internal/%252e%252e",
+      "https://broker.fcim.internal/%2f",
+      "https://broker.fcim.internal/%252f",
+      "https://broker.fcim.internal/%5c",
+      "https://broker.fcim.internal/%255c",
+      "https://broker.fcim.internal\\evil",
+    ];
+
+    for (const raw of normalisedAway) {
+      expect(() => parseAndValidateBrokerUrl(raw)).toThrow();
+    }
+
+    // The specific traversal message, so the check cannot silently become a shape check only.
+    expect(() => parseAndValidateBrokerUrl("https://broker.fcim.internal/../")).toThrow(/path traversal/i);
+    expect(() => parseAndValidateBrokerUrl("https://broker.fcim.internal/%2e%2e")).toThrow(/path traversal/i);
+  });
+
+  it("accepts a host with at most one trailing slash and rejects ports and extra slashes", () => {
+    expect(parseAndValidateBrokerUrl("https://broker.fcim.internal/").origin).toBe("https://broker.fcim.internal");
+
+    expect(() => parseAndValidateBrokerUrl("https://broker.fcim.internal//")).toThrow(/origin only/i);
+    expect(() => parseAndValidateBrokerUrl("https://broker.fcim.internal///")).toThrow(/origin only/i);
+    expect(() => parseAndValidateBrokerUrl("https://broker.fcim.internal:8443")).toThrow(/port/i);
+    expect(() => parseAndValidateBrokerUrl("https://broker.fcim.internal:443")).toThrow(/port/i);
+    expect(() => parseAndValidateBrokerUrl("")).toThrow(/not configured/i);
+  });
+
   it("strictly validates path tokens against path traversal", () => {
     // Valid tokens
     expect(validatePathToken("snap-2026-09-08", "snapshot_id")).toBe("snap-2026-09-08");

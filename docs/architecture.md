@@ -128,6 +128,99 @@ Raising `config.parserVersion` invalidates the cache: the next check re-download
 re-parses the PDF even when it is byte-identical, so a parser fix reaches users without
 waiting for the university to publish a new file.
 
+## The schedule broker (Cloudflare Worker + R2)
+
+FCIM sits behind Cloudflare and answers a container in a datacentre far less reliably than it
+answers a Worker at the edge. So an optional broker stands between them: a Worker that mirrors the
+official timetable PDFs into immutable R2 snapshots, and stores the accepted state Render produces.
+
+```
+FCIM ──▶ Cloudflare Worker ──▶ R2 candidate snapshots ──▶ Render semantic selection /
+                                                          parser / validator
+                                                                  │
+                                                                  ▼
+                                              durable accepted state ──▶ local serving state
+```
+
+The division of labour is strict and is the reason the broker can stay this simple:
+
+  - **The Worker is a transport.** It mirrors *every* strictly-valid official timetable PDF the
+    authoritative page references. It does not read a course year, semester, revision or
+    "master vs licență" out of a filename — a filename filter cannot be semantically complete, and
+    an incomplete one starves discovery of the very candidate it needed.
+  - **Render is the timetable authority.** `discoverPdf(renderedHtml, courseYear)` runs against the
+    snapshot's own archived `page-api.json`, so selection is reproducible from the snapshot alone,
+    and the file it picks must be present in that snapshot's manifest or the update is rejected.
+
+### Split publication
+
+A Worker on the Cloudflare Free plan gets 10 ms of CPU per invocation. Fetching six PDFs
+(~4.3 MB) and closing a snapshot in one invocation measured 11–14 ms, so publication is four
+bounded stages, one invocation each, joined by a Cloudflare Queue with a batch size of one:
+
+```
+cron (*/20) or authenticated POST /publish   producer-only; enqueue discovery
+  │
+  ▼
+DISCOVERY            one Queue invocation
+  ├─ read current.json, parse the strict or exact legacy shape, keep its ETag as the CAS token
+  ├─ load legacy Page/PDF validators from that pointer's immutable manifest (never fabricate them)
+  ├─ GET the Page API (redirect: manual — a redirect is refused, never followed)
+  ├─ unchanged?  modified_gmt equal + same PDF catalogue + every mirrored PDF 304  ──▶ stop
+  ├─ write snapshots/<id>/page-api.json          (create-only)
+  ├─ write pending/<id>/descriptor.json          (create-only; fixes the expected file set)
+  └─ enqueue one ingest job per PDF + a backstop finalize
+  │
+  ▼
+PDF INGEST           one invocation per PDF
+  ├─ re-validate the job against the descriptor
+  ├─ GET the PDF (redirects re-checked against the same URL policy)
+  ├─ stream the body into snapshots/<id>/pdfs/<file>   (create-only, byte-capped)
+  ├─ write pending/<id>/completed/<file-id>.json       (create-only)
+  └─ enqueue a finalize
+  │
+  ▼
+FINALIZE             one invocation
+  ├─ every descriptor file present, every completion marker present?  no ──▶ incomplete, stop
+  ├─ write snapshots/<id>/manifest.json          (create-only)
+  └─ CAS current.json against the ETag discovery read                  ── LAST
+```
+
+`current.json` may name a snapshot only when its `page-api.json`, every descriptor file, every
+completion marker and its manifest all exist and agree, so a half-built snapshot is not a risk —
+it is simply never pointed at. A cycle that loses the CAS to a newer publisher leaves its snapshot
+behind as harmless history rather than overwriting anything.
+
+Every stage is safe to run twice. Snapshot children are created with `If-None-Match: *`, so a
+redelivered ingest job either finds its own object already there (success) or finds someone else's
+(failure — never an overwrite); a redelivered finalize that sees `current.json` already naming its
+snapshot reports success without touching it. Completion is recorded as one immutable marker per
+file rather than a shared counter, because two concurrent ingests can lose an update to a counter
+and cannot lose disjoint keys.
+
+Failures are visible rather than absorbed. The queue processes one message at a time, retries at
+most three times, waits 300 seconds between retryable attempts, and sends exhausted messages to
+`fcim-broker-publication-dlq`. Network failures and upstream 403, 429 and 5xx responses are
+retryable; malformed jobs, invalid immutable state and security-policy rejections are logged and
+acknowledged because another attempt cannot change them. A snapshot left unfinished is re-driven
+by a reconciliation pass the cron queues each tick, which re-enqueues only the ingest jobs whose
+completion markers are missing. A Page API redirect or other deterministic failure is still an
+error — the previous `current.json` is left exactly as it was. Only a genuine 304 (or an unchanged
+`modified_gmt` with an unchanged catalogue and unchanged PDFs) means "unchanged".
+
+### Accepted state
+
+Accepted state — what Render actually parsed and validated — is stored in two pieces so the Worker
+never has to hold a ~200 KB Schedule in memory: an immutable payload streamed straight into R2
+under a content-addressed id, and a small compare-and-swapped pointer that names it. The pointer is
+written only after the payload exists and only if every field agrees with the payload's own stored
+metadata, and `Content-Length` is treated as a hint — the size limit is enforced on the counted
+bytes of the stream, so a chunked upload cannot exceed it.
+
+The broker's supported course years live in one list (`worker/src/courses.ts`) and every accepted
+route re-checks against it: `course-0`, `course-3`, `course-99` and `course-01` are all refused
+rather than coerced by `parseInt`.
+
 ## Odd / even weeks
 
 Half-height cells in the PDF alternate weekly, so every lesson carries `week_parity`

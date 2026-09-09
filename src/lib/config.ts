@@ -76,8 +76,10 @@ export const config = {
   parserVersion: "1.3.0",
   timezone: "Europe/Chisinau",
   databaseUrl: process.env.DATABASE_URL ?? "",
-  /** Cloudflare Worker + R2 schedule broker base URL (e.g. https://broker.example.workers.dev). Unset = direct FCIM. */
-  brokerUrl: (process.env.SCHEDULE_BROKER_URL ?? "").replace(/\/+$/, ""),
+  /** Cloudflare Worker + R2 schedule broker base URL (e.g. https://broker.example.workers.dev). Unset = direct FCIM.
+   *  Kept verbatim: `parseAndValidateBrokerUrl` inspects the configured string *before* any
+   *  normalisation, because trimming is exactly what would hide a traversal segment from it. */
+  brokerUrl: (process.env.SCHEDULE_BROKER_URL ?? "").trim(),
   /** Bearer secret token for authenticating durable accepted-state writes to the broker. */
   brokerSecret: process.env.SCHEDULE_BROKER_SECRET ?? "",
   /** Timeout for broker requests during cold-start bootstrap and sync (default 3000 ms). */
