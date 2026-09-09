@@ -20,7 +20,12 @@
  */
 
 import { extractOfficialPdfUrls, getPdfFilename } from "./extractor";
-import { buildFinalizeJob, buildIngestJob, fileIdForIndex } from "./jobs";
+import { buildFinalizeJob, buildIngestJob, fileIdForIndex, qualifiedPdfFilename, validateJob } from "./jobs";
+import { isOfficialTimetablePdfUrl } from "../../worker-shared/fcim-policy";
+import {
+  PENDING_MAX_AGE_MS, RECONCILE_PAGE_SIZE, RECONCILE_SCAN_PAGES,
+  readScanCursor, writeScanCursor, runRetention, snapshotIdInstant, snapshotWorkExpired,
+} from "./maintenance";
 import {
   CURRENT_KEY,
   PENDING_PREFIX,
@@ -37,7 +42,6 @@ import {
   buildCurrentPointer,
   normalizePageModifiedGmt,
   parseCurrentPointer,
-  SNAPSHOT_ID_REGEX,
 } from "./pointer";
 import { contentLengthOrNull, isPayloadTooLarge, putLimitedStream } from "./stream-limit";
 import type {
@@ -64,9 +68,6 @@ const FINALIZE_BACKSTOP_DELAY_SECONDS = 30;
 /** How many unfinished snapshots one reconcile invocation will re-drive. */
 const MAX_RECONCILED_SNAPSHOTS = 3;
 
-/** A pending snapshot older than this is abandoned history, not work to retry. */
-const PENDING_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-
 /** Leave a freshly scheduled snapshot alone; its own ingest jobs are still in flight. */
 const PENDING_MIN_AGE_MS = 5 * 60 * 1000;
 
@@ -78,15 +79,6 @@ export function generateSnapshotId(now = new Date()): string {
   const iso = now.toISOString().replace(/[:.]/g, "-");
   const randomSuffix = crypto.randomUUID().slice(0, 8);
   return `${iso}-${randomSuffix}`;
-}
-
-/** Recover the creation instant a snapshot id encodes, without trusting a stored field. */
-function snapshotIdInstant(snapshotId: string): number | null {
-  if (!SNAPSHOT_ID_REGEX.test(snapshotId)) return null;
-  const stamp = snapshotId.slice(0, 24);
-  const iso = `${stamp.slice(0, 13)}:${stamp.slice(14, 16)}:${stamp.slice(17, 19)}.${stamp.slice(20, 23)}Z`;
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? ms : null;
 }
 
 /* ------------------------------------------------------------------ *
@@ -147,12 +139,16 @@ async function anyPreviousPdfChanged(env: Env, manifest: SnapshotManifest): Prom
 export function planSnapshotFiles(snapshotId: string, pdfUrls: readonly string[]): PendingFile[] {
   const taken = new Set<string>();
   return pdfUrls.map((sourceUrl, index) => {
+    if (!isOfficialTimetablePdfUrl(sourceUrl)) throw new Error(`Invalid official PDF URL: ${sourceUrl}`);
     const basename = getPdfFilename(sourceUrl);
     let filename = basename;
     if (taken.has(filename)) {
-      const month = /\/(\d{4})\/(\d{2})\//.exec(sourceUrl);
-      filename = month ? `${month[1]}-${month[2]}-${basename}` : `${fileIdForIndex(index)}-${basename}`;
+      filename = qualifiedPdfFilename(sourceUrl);
     }
+    if (taken.has(filename)) filename = qualifiedPdfFilename(sourceUrl, fileIdForIndex(index));
+    if (taken.has(filename)) throw new Error(`Cannot assign a unique PDF filename for ${sourceUrl}`);
+    const checked = validateJob(buildIngestJob({ snapshotId, fileId: fileIdForIndex(index), filename, sourceUrl }));
+    if (!checked.ok) throw new Error(`Invalid planned ingest: ${checked.error}`);
     taken.add(filename);
     return {
       file_id: fileIdForIndex(index),
@@ -302,6 +298,10 @@ export async function runDiscovery(
   const snapshotId = generateSnapshotId();
   const createdAt = new Date().toISOString();
 
+  let files: PendingFile[];
+  try { files = planSnapshotFiles(snapshotId, pdfUrls); }
+  catch (err) { return { outcome: "error", error: (err as Error).message, retryable: false }; }
+
   const pageApiWritten = await env.R2_BUCKET.put(snapshotPageApiKey(snapshotId), pageBytes, {
     onlyIf: IF_NONE_MATCH_COND,
     httpMetadata: { contentType: "application/json" },
@@ -313,8 +313,6 @@ export async function runDiscovery(
       error: `Collision: ${snapshotPageApiKey(snapshotId)} already exists under an immutable snapshot`,
     };
   }
-
-  const files = planSnapshotFiles(snapshotId, pdfUrls);
 
   const descriptor: PendingDescriptor = {
     schema_version: 1,
@@ -384,6 +382,23 @@ async function readDescriptor(env: Env, snapshotId: string): Promise<PendingDesc
   }
 }
 
+/** Deterministic descriptor failures never generate poison ingest work or reach publication. */
+function descriptorJobError(descriptor: PendingDescriptor): string | null {
+  if (!Array.isArray(descriptor.files) || descriptor.files.length === 0) return "Invalid descriptor file set";
+  const ids = new Set<string>();
+  const keys = new Set<string>();
+  for (const file of descriptor.files) {
+    if (!file || typeof file !== "object") return "Invalid descriptor file entry";
+    const checked = validateJob({ schema_version: 1, kind: "ingest_pdf", snapshot_id: descriptor.snapshot_id,
+      file_id: file.file_id, filename: file.filename, source_url: file.source_url, r2_key: file.r2_key });
+    if (!checked.ok) return `Descriptor cannot produce valid ingest job: ${checked.error}`;
+    if (ids.has(file.file_id) || keys.has(file.r2_key)) return "Duplicate descriptor file ID or key";
+    ids.add(file.file_id);
+    keys.add(file.r2_key);
+  }
+  return null;
+}
+
 function markerFor(
   job: IngestPdfJob,
   meta: { contentType: string | null; size: number | null; etag: string | null; lastModified: string | null },
@@ -412,6 +427,10 @@ function markerFor(
  * would have written is a success, and one that exists with different provenance is a failure.
  */
 export async function runPdfIngest(env: Env, job: IngestPdfJob): Promise<IngestResult> {
+  if (snapshotWorkExpired(job.snapshot_id)) {
+    return { outcome: "error", snapshot_id: job.snapshot_id, file_id: job.file_id,
+      error: "Snapshot publication window expired", retryable: false };
+  }
   const descriptor = await readDescriptor(env, job.snapshot_id);
   if (!descriptor) {
     return {
@@ -422,6 +441,9 @@ export async function runPdfIngest(env: Env, job: IngestPdfJob): Promise<IngestR
     };
   }
 
+  const descriptorError = descriptorJobError(descriptor);
+  if (descriptorError) return { outcome: "error", snapshot_id: job.snapshot_id, file_id: job.file_id,
+    error: descriptorError, retryable: false };
   const expected = descriptor.files.find((f) => f.file_id === job.file_id);
   if (
     !expected ||
@@ -619,6 +641,10 @@ export async function runFinalize(env: Env, snapshotId: string): Promise<Finaliz
     return { outcome: "already_current", snapshot_id: snapshotId };
   }
 
+  if (snapshotWorkExpired(snapshotId)) {
+    return { outcome: "error", snapshot_id: snapshotId, error: "Snapshot publication window expired", retryable: false };
+  }
+
   const descriptor = await readDescriptor(env, snapshotId);
   if (!descriptor) {
     return {
@@ -628,6 +654,8 @@ export async function runFinalize(env: Env, snapshotId: string): Promise<Finaliz
     };
   }
 
+  const descriptorError = descriptorJobError(descriptor);
+  if (descriptorError) return { outcome: "error", snapshot_id: snapshotId, error: descriptorError, retryable: false };
   const pageApi = await env.R2_BUCKET.head(snapshotPageApiKey(snapshotId));
   if (!pageApi) {
     return {
@@ -742,6 +770,9 @@ export async function runFinalize(env: Env, snapshotId: string): Promise<Finaliz
     pdfCount: files.length,
   });
 
+  if (snapshotWorkExpired(snapshotId)) {
+    return { outcome: "error", snapshot_id: snapshotId, error: "Snapshot publication window expired", retryable: false };
+  }
   const casResult = await env.R2_BUCKET.put(CURRENT_KEY, JSON.stringify(pointer), {
     onlyIf: descriptor.current_etag
       ? { etagMatches: descriptor.current_etag }
@@ -769,26 +800,31 @@ export async function runFinalize(env: Env, snapshotId: string): Promise<Finaliz
  * job that exhausted its queue retries and landed in the dead-letter queue.
  */
 export async function runReconcile(env: Env): Promise<ReconcileResult> {
-  let listing;
+  const bucket = env.R2_BUCKET;
   let current;
+  let nextCursor: string | undefined;
+  const scanned: string[] = [];
   try {
-    [listing, current] = await Promise.all([
-      env.R2_BUCKET.list({ prefix: PENDING_PREFIX, delimiter: "/", limit: 100 }),
-      env.R2_BUCKET.head(CURRENT_KEY),
-    ]);
+    current = await bucket.head(CURRENT_KEY);
+    nextCursor = await readScanCursor(bucket, "reconcile");
+    for (let page = 0; page < RECONCILE_SCAN_PAGES; page++) {
+      const listing = await bucket.list({
+        prefix: PENDING_PREFIX, delimiter: "/", limit: RECONCILE_PAGE_SIZE, cursor: nextCursor,
+      });
+      scanned.push(...listing.delimitedPrefixes);
+      if (listing.truncated && !listing.cursor) throw new Error("R2 pending listing truncated without cursor");
+      nextCursor = listing.truncated ? listing.cursor : undefined;
+      if (!listing.truncated) break;
+    }
   } catch (err) {
     return {
-      outcome: "error",
-      pending_examined: 0,
-      requeued_ingests: 0,
-      requeued_finalizes: 0,
-      error: (err as Error).message,
-      retryable: true,
+      outcome: "error", pending_examined: 0, requeued_ingests: 0, requeued_finalizes: 0,
+      error: (err as Error).message, retryable: true,
     };
   }
 
   const now = Date.now();
-  const candidates = listing.delimitedPrefixes
+  const candidates = [...new Set(scanned)]
     .map((prefix) => prefix.slice(PENDING_PREFIX.length).replace(/\/$/, ""))
     .filter((id) => {
       const created = snapshotIdInstant(id);
@@ -797,13 +833,13 @@ export async function runReconcile(env: Env): Promise<ReconcileResult> {
       return age >= PENDING_MIN_AGE_MS && age <= PENDING_MAX_AGE_MS;
     })
     .sort()
-    .reverse()
-    .slice(0, MAX_RECONCILED_SNAPSHOTS);
+    .reverse();
 
   let requeuedIngests = 0;
   let requeuedFinalizes = 0;
 
   for (const snapshotId of candidates) {
+    if (requeuedFinalizes >= MAX_RECONCILED_SNAPSHOTS) break;
     if (await env.R2_BUCKET.head(snapshotManifestKey(snapshotId))) {
       continue; // already finalized
     }
@@ -814,6 +850,11 @@ export async function runReconcile(env: Env): Promise<ReconcileResult> {
     // at discovery. Once that changes, fetching its missing PDFs would create load for a snapshot
     // that is already provably superseded, so leave it as harmless immutable history.
     if (descriptor.current_etag !== (current?.etag ?? null)) continue;
+    const descriptorError = descriptorJobError(descriptor);
+    if (descriptorError) {
+      console.error(`Snapshot ${snapshotId} deterministically failed: ${descriptorError}`);
+      continue;
+    }
 
     const pending: { body: PublicationJob }[] = [];
     for (const file of descriptor.files) {
@@ -835,6 +876,10 @@ export async function runReconcile(env: Env): Promise<ReconcileResult> {
     requeuedIngests += pending.length - 1;
     requeuedFinalizes += 1;
   }
+
+  // Persist only after repair dispatch succeeds: a crash repeats idempotent repair, never skips it.
+  await writeScanCursor(bucket, "reconcile", nextCursor);
+  await runRetention(env);
 
   return {
     outcome: requeuedIngests + requeuedFinalizes > 0 ? "requeued" : "idle",

@@ -8,12 +8,21 @@
  */
 
 import { isOfficialTimetablePdfUrl } from "./extractor";
+import { isSafeOfficialPdfFilename, MAX_OFFICIAL_PDF_FILENAME_LENGTH } from "../../worker-shared/fcim-policy";
 import { snapshotPdfKey } from "./keys";
 import { SNAPSHOT_ID_REGEX } from "./pointer";
 import type { DiscoverJob, FinalizeJob, IngestPdfJob, PublicationJob, ReconcileJob } from "./types";
 
 const FILE_ID_REGEX = /^f\d{1,3}$/;
-const PDF_FILENAME_REGEX = /^[a-zA-Z0-9_\-.]{1,128}\.pdf$/;
+
+/** Keep the extension and canonical length even when qualifying a boundary-length basename. */
+export function qualifiedPdfFilename(sourceUrl: string, fileId?: string): string {
+  const basename = sourceUrl.slice(sourceUrl.lastIndexOf("/") + 1);
+  const month = /\/(\d{4})\/(\d{2})\//.exec(sourceUrl)!;
+  const prefix = `${fileId ? `${fileId}-` : ""}${month[1]}-${month[2]}-`;
+  const stem = basename.slice(0, -4).slice(0, MAX_OFFICIAL_PDF_FILENAME_LENGTH - 4 - prefix.length).replace(/\.+$/, "");
+  return prefix + stem + basename.slice(-4);
+}
 
 export type JobValidation =
   | { ok: true; job: PublicationJob }
@@ -97,7 +106,7 @@ export function validateJob(body: unknown): JobValidation {
         return fail("ingest job has an invalid file_id");
       }
       const filename = job.filename;
-      if (typeof filename !== "string" || !PDF_FILENAME_REGEX.test(filename)) {
+      if (typeof filename !== "string" || !isSafeOfficialPdfFilename(filename)) {
         return fail("ingest job has an invalid filename");
       }
       const sourceUrl = job.source_url;
@@ -111,9 +120,8 @@ export function validateJob(body: unknown): JobValidation {
       // The stored name is the URL's basename, or that basename qualified with its upload month
       // when two folders publish the same basename. Nothing else may name the object.
       const basename = sourceUrl.slice(sourceUrl.lastIndexOf("/") + 1);
-      const month = /\/(\d{4})\/(\d{2})\//.exec(sourceUrl);
-      const qualified = month ? `${month[1]}-${month[2]}-${basename}` : null;
-      if (filename !== basename && filename !== qualified) {
+      if (filename !== basename && filename !== qualifiedPdfFilename(sourceUrl) &&
+          filename !== qualifiedPdfFilename(sourceUrl, fileId)) {
         return fail("ingest job filename does not derive from its source_url");
       }
       return {

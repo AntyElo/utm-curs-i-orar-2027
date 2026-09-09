@@ -61,6 +61,10 @@ interface StoredObject {
 
 export class MockR2Bucket implements R2Bucket {
   private storage = new Map<string, StoredObject>();
+  readonly listings: R2ListOptions[] = [];
+  readonly deletions: string[][] = [];
+  /** R2 may return fewer than the requested limit. */
+  listPageSize = 1000;
 
   async head(key: string): Promise<R2Object | null> {
     const item = this.storage.get(key);
@@ -130,12 +134,16 @@ export class MockR2Bucket implements R2Bucket {
   }
 
   async delete(keys: string | string[]): Promise<void> {
-    for (const key of Array.isArray(keys) ? keys : [keys]) {
+    const batch = Array.isArray(keys) ? keys : [keys];
+    if (batch.length > 1000) throw new Error("R2 bulk delete limit exceeded");
+    this.deletions.push([...batch]);
+    for (const key of batch) {
       this.storage.delete(key);
     }
   }
 
   async list(options: R2ListOptions = {}): Promise<R2Objects> {
+    this.listings.push({ ...options });
     const prefix = options.prefix ?? "";
     const delimiter = options.delimiter;
     const objects: R2Object[] = [];
@@ -154,11 +162,21 @@ export class MockR2Bucket implements R2Bucket {
       objects.push(this.toObject(key, item));
     }
 
-    const limit = options.limit ?? 1000;
+    // One lexicographic stream for objects AND grouped prefixes. The opaque continuation
+    // represents the last emitted key, so deleting earlier keys cannot shift page offsets.
+    const entries = [
+      ...objects.map((object) => ({ key: object.key, object })),
+      ...Array.from(prefixes).map((key) => ({ key, object: null })),
+    ].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    const after = options.cursor ? JSON.parse(atob(options.cursor)) as string : null;
+    const remaining = entries.filter((entry) => after === null || entry.key > after);
+    const page = remaining.slice(0, Math.min(options.limit ?? 1000, this.listPageSize));
+    const truncated = remaining.length > page.length;
     return {
-      objects: objects.slice(0, limit),
-      delimitedPrefixes: Array.from(prefixes).slice(0, limit),
-      truncated: false,
+      objects: page.flatMap((entry) => entry.object ? [entry.object] : []),
+      delimitedPrefixes: page.filter((entry) => !entry.object).map((entry) => entry.key),
+      truncated,
+      ...(truncated ? { cursor: btoa(JSON.stringify(page[page.length - 1].key)) } : {}),
     };
   }
 

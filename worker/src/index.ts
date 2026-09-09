@@ -17,6 +17,7 @@
  * Queue consumer -> one bounded publication stage per invocation
  */
 
+import { isSafeOfficialPdfFilename } from "../../worker-shared/fcim-policy";
 import {
   handleGetAccepted,
   handleGetAcceptedPayload,
@@ -37,7 +38,6 @@ import type {
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
-const PDF_FILENAME_REGEX = /^[a-zA-Z0-9_\-.]{1,128}\.pdf$/;
 const COURSE_TOKEN_REGEX = /^course-(\d{1,3})$/;
 const RETRY_DELAY_SECONDS = 300;
 
@@ -140,7 +140,7 @@ const worker = {
       if (segments.length === 3 && segments[2] === "page-api.json") {
         return serveImmutable(env, snapshotPageApiKey(snapshotId), "application/json", 3600);
       }
-      if (segments.length === 4 && segments[2] === "pdfs" && PDF_FILENAME_REGEX.test(segments[3])) {
+      if (segments.length === 4 && segments[2] === "pdfs" && isSafeOfficialPdfFilename(segments[3])) {
         return serveImmutable(env, snapshotPdfKey(snapshotId, segments[3]), "application/pdf", 86400);
       }
       return notFound();

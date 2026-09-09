@@ -20,6 +20,12 @@ export const FCIM_UPSTREAM_CF_RAY_HEADER = "X-FCIM-Upstream-CF-Ray";
 
 const OFFICIAL_ORIGIN = "https://fcim.utm.md";
 const SAFE_PDF_FILENAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,190}\.pdf$/i;
+export const MAX_OFFICIAL_PDF_FILENAME_LENGTH = 195;
+
+/** Canonical policy for both upstream basenames and stored/served PDF names. */
+export function isSafeOfficialPdfFilename(filename: string): boolean {
+  return SAFE_PDF_FILENAME.exec(filename)?.[0] === filename && !filename.includes("..");
+}
 const OFFICIAL_TIMETABLE_PDF_PATH =
   /^\/wp-content\/uploads\/sites\/24\/(\d{4})\/(0[1-9]|1[0-2])\/([^/]+)$/;
 
@@ -59,7 +65,7 @@ export function isOfficialTimetablePdfUrl(rawUrl: string): boolean {
     parsed.origin === OFFICIAL_ORIGIN &&
     parsed.toString() === rawUrl &&
     pathMatch !== null &&
-    SAFE_PDF_FILENAME.test(pathMatch[3])
+    isSafeOfficialPdfFilename(pathMatch[3])
   );
 }
 
