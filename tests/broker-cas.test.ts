@@ -14,8 +14,36 @@ import {
 } from "../worker/src/extractor";
 import { generateSnapshotId } from "../worker/src/publisher";
 import { SNAPSHOT_ID_REGEX } from "../worker/src/pointer";
-import type { AcceptedPointer } from "../worker/src/types";
+import { acceptedPointerKey } from "../worker/src/keys";
+import type { AcceptedPointer, R2Object, R2PutOptions } from "../worker/src/types";
 import { createHarness, MockR2Bucket } from "./helpers/worker-doubles";
+
+/**
+ * R2 double that lets a test slip a concurrent write in between the Worker's `get()` of the
+ * accepted pointer and the conditional `put()` that carries that object's ETag — the exact
+ * window `onlyIf: { etagMatches }` exists to close.
+ */
+class RacingR2Bucket extends MockR2Bucket {
+  private pendingRace: { key: string; run: () => void } | null = null;
+
+  /** Run `run` once, immediately before the next `put()` to `key` evaluates its precondition. */
+  raceBeforeNextPut(key: string, run: () => void): void {
+    this.pendingRace = { key, run };
+  }
+
+  override async put(
+    key: string,
+    value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob,
+    options?: R2PutOptions,
+  ): Promise<R2Object | null> {
+    if (this.pendingRace && this.pendingRace.key === key) {
+      const { run } = this.pendingRace;
+      this.pendingRace = null;
+      run();
+    }
+    return super.put(key, value, options);
+  }
+}
 
 const SNAPSHOT_ID = "2026-09-08T02-08-48-000Z-7a3b4c19";
 const OTHER_SNAPSHOT_ID = "2026-09-08T03-11-02-500Z-9f0e1d22";
@@ -390,5 +418,75 @@ describe("worker accepted-state gateway & CAS semantics", () => {
     const getRes = await handleGetAccepted(env, "1");
     const fetched = (await getRes.json()) as AcceptedPointer;
     expect(fetched.accepted_id).toBe(updatedPointer.accepted_id);
+  });
+
+  it("returns 409 CAS_CONFLICT when the pointer object changes between the ETag read and the conditional PUT", async () => {
+    const bucket = new RacingR2Bucket();
+    const { env } = createHarness({ SCHEDULE_BROKER_SECRET: "secret", R2_BUCKET: bucket });
+    const pointerKey = acceptedPointerKey(1);
+
+    // Pointer A is the installed accepted state; Render read it and holds its accepted_id.
+    seedPayload(bucket, samplePointer);
+    const created = await handlePutAccepted(
+      pointerRequest({ expected_previous_accepted_id: null, pointer: samplePointer }),
+      env,
+      "1",
+    );
+    expect(created.status).toBe(200);
+    const etagA = (await bucket.head(pointerKey))!.etag;
+
+    // Pointer C is what this request wants to install.
+    const acceptedIdC = "c6e832f46ff75dd0-p1_3_0-3333333333333333";
+    const pointerC: AcceptedPointer = {
+      ...samplePointer,
+      accepted_id: acceptedIdC,
+      payload_key: `accepted-payloads/course-1/${acceptedIdC}.json`,
+      payload_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+      source_pdf_hash: "c6e832f46ff75dd098d6eb42300ffc8abb223d8a394496988f29f2fc1637c80b",
+      source_pdf_url: OTHER_PDF_URL,
+      source_snapshot_id: OTHER_SNAPSHOT_ID,
+    };
+    seedPayload(bucket, pointerC);
+
+    // Pointer B is a competing writer that lands after the Worker's read, before its write.
+    const acceptedIdB = "b5d721e35ee64ccf-p1_3_0-4444444444444444";
+    const pointerB: AcceptedPointer = {
+      ...samplePointer,
+      accepted_id: acceptedIdB,
+      payload_key: `accepted-payloads/course-1/${acceptedIdB}.json`,
+      payload_sha256: "4444444444444444444444444444444444444444444444444444444444444444",
+      source_pdf_hash: "b5d721e35ee64ccf98d6eb42300ffc8abb223d8a394496988f29f2fc1637c80b",
+      source_pdf_url: OTHER_PDF_URL,
+      source_snapshot_id: OTHER_SNAPSHOT_ID,
+    };
+    seedPayload(bucket, pointerB);
+    bucket.raceBeforeNextPut(pointerKey, () => {
+      bucket.seed(pointerKey, JSON.stringify(pointerB));
+    });
+
+    // expected_previous_accepted_id still matches A, so the application-level check passes and
+    // the request reaches the `onlyIf: { etagMatches }` branch — which is what must reject it.
+    const res = await handlePutAccepted(
+      pointerRequest({ expected_previous_accepted_id: samplePointer.accepted_id, pointer: pointerC }),
+      env,
+      "1",
+    );
+
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string; code?: string };
+    expect(body.code).toBe("CAS_CONFLICT");
+    expect(body.error).toContain("concurrent write modified accepted pointer");
+    // Not the accepted_id comparison path — that branch carries no code and a different message.
+    expect(body.error).not.toContain("differs from expected");
+
+    // The racing write survives untouched; C was never installed.
+    const stored = bucket.json<AcceptedPointer>(pointerKey);
+    expect(stored?.accepted_id).toBe(acceptedIdB);
+    expect(stored?.payload_sha256).toBe(pointerB.payload_sha256);
+    expect((await bucket.head(pointerKey))!.etag).not.toBe(etagA);
+
+    const getRes = await handleGetAccepted(env, "1");
+    expect(getRes.status).toBe(200);
+    expect(((await getRes.json()) as AcceptedPointer).accepted_id).toBe(acceptedIdB);
   });
 });
