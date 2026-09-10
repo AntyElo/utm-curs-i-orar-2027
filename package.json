@@ -11,7 +11,10 @@
     "test": "vitest run",
     "parser": "tsx scripts/parser-cli.ts",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate"
+    "db:migrate": "drizzle-kit migrate",
+    "typecheck:worker": "tsc -p worker/tsconfig.json --noEmit",
+    "typecheck:publisher": "tsc -p tools/md-publisher/tsconfig.json --noEmit",
+    "build:publisher": "tsc -p tools/md-publisher/tsconfig.build.json"
   },
   "dependencies": {
     "cheerio": "^1.2.0",

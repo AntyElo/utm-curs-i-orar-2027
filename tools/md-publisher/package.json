@@ -1,0 +1,17 @@
+{
+  "name": "fcim-md-publisher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Transport-only FCIM timetable publisher for the Moldova laptop",
+  "bin": {
+    "md-publisher": "./dist/tools/md-publisher/src/index.js"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node ./dist/tools/md-publisher/src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

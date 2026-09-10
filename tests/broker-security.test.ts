@@ -1,19 +1,20 @@
 /**
  * Audit regression suite for the broker's input boundaries:
- * NR-C (exact /publish routing), NR-D (strict current.json parsing), E-06 (actual streamed byte
- * limit), E-08 (Page API redirect refusal) and the explicit supported-course contract.
+ * NR-C, now Gate F (the retired /publish trigger and exact publisher routing), NR-D (strict
+ * current.json parsing), E-06 (actual streamed byte limit), E-08 (Page API redirect refusal)
+ * and the explicit supported-course contract.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { handlePutAccepted, handlePutAcceptedPayload, MAX_PAYLOAD_BYTES } from "../worker/src/accepted-handler";
 import { parseSupportedCourseYear, SUPPORTED_COURSE_YEARS } from "../worker/src/courses";
 import worker from "../worker/src/index";
-import { validateJob } from "../worker/src/jobs";
+import { validateJob, validatePendingFile } from "../worker/src/jobs";
 import { fetchPageApi, PageApiError, resolvePageApiUrl } from "../worker/src/page-api";
 import { buildCurrentPointer, parseCurrentPointer } from "../worker/src/pointer";
 import { putLimitedStream } from "../worker/src/stream-limit";
 import type { AcceptedPointer } from "../worker/src/types";
-import { createHarness, MockR2Bucket } from "./helpers/worker-doubles";
+import { createHarness, MockR2Bucket, TEST_PUBLISHER_TOKEN } from "./helpers/worker-doubles";
 
 const SNAPSHOT_ID = "2026-09-08T02-08-48-000Z-7a3b4c19";
 const PDF_URL = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/anul_i_semestrul_i-18.pdf";
@@ -39,32 +40,35 @@ function stubFetch(impl: (url: string, init?: RequestInit) => Response | Promise
  * NR-C: /publish is matched exactly
  * ------------------------------------------------------------------ */
 
-describe("NR-C: exact /publish routing", () => {
-  const AUTH = { Authorization: "Bearer test-secret" };
+describe("NR-C / Gate F: the retired /publish trigger and exact publisher routing", () => {
+  const ACCEPTED_AUTH = { Authorization: "Bearer test-secret" };
+  const PUBLISHER_AUTH = { Authorization: `Bearer ${TEST_PUBLISHER_TOKEN}` };
 
-  async function post(path: string, headers: Record<string, string> = AUTH) {
+  async function request(path: string, method: string, headers: Record<string, string>) {
     const h = createHarness({ FCIM_PAGE_API_URL: PAGE_API_URL });
     const upstream = stubFetch(() => {
-      throw new Error("publisher must not be reachable from this route");
+      throw new Error("no broker route may reach the Internet");
     });
-    const res = await worker.fetch(new Request(`https://broker.local${path}`, { method: "POST", headers }), h.env, h.ctx);
+    const res = await worker.fetch(new Request(`https://broker.local${path}`, { method, headers }), h.env, h.ctx);
     return { res, h, upstream };
   }
 
-  const rejected = [
-    "/foo/publish",
-    "/foo/publish?force=1",
-    "/x/publish?anything",
-    "/?next=/publish?",
-    "/publish/extra",
+  // Gate F removed the trigger entirely: there is no authenticated way to ask the broker to go
+  // and fetch anything, with or without a force query, under any spelling of the old path.
+  const retired = [
+    "/publish",
+    "/publish?force=1",
+    "/publish?anything",
     "/publish/",
-    "/PUBLISH",
+    "/publish/extra",
+    "/foo/publish",
     "/api/publish",
+    "/PUBLISH",
   ];
 
-  for (const path of rejected) {
-    it(`404s ${path} without entering publisher logic, even with the correct secret`, async () => {
-      const { res, h, upstream } = await post(path);
+  for (const path of retired) {
+    it(`404s ${path} and performs no work, even with the accepted-state secret`, async () => {
+      const { res, h, upstream } = await request(path, "POST", ACCEPTED_AUTH);
       expect(res.status).toBe(404);
       expect(upstream).not.toHaveBeenCalled();
       expect(h.bucket.keys()).toEqual([]);
@@ -72,46 +76,39 @@ describe("NR-C: exact /publish routing", () => {
     });
   }
 
-  const badQueries = ["?anything", "?force=2", "?force=1&extra=1", "?force=true", "?force=1&force=1"];
+  // The publisher routes are matched on the parsed path and nothing else.
+  const notPublisherRoutes = [
+    "/foo/publications",
+    "/publications/extra/segments/here/more",
+    "/publisher/heartbeat/extra",
+    "/publication-status/extra",
+    "/PUBLICATIONS",
+  ];
 
-  for (const query of badQueries) {
-    it(`400s /publish${query} before authenticating or publishing`, async () => {
-      const { res, h, upstream } = await post(`/publish${query}`);
-      expect(res.status).toBe(400);
-      expect(upstream).not.toHaveBeenCalled();
+  for (const path of notPublisherRoutes) {
+    it(`404s ${path} without entering publisher logic`, async () => {
+      const { res, h } = await request(path, "POST", PUBLISHER_AUTH);
+      expect(res.status).toBe(404);
       expect(h.bucket.keys()).toEqual([]);
     });
   }
 
-  it("401s POST /publish without the bearer secret", async () => {
-    const { res, upstream } = await post("/publish", {});
-    expect(res.status).toBe(401);
-    expect(upstream).not.toHaveBeenCalled();
-  });
-
-  it("405s a non-POST /publish", async () => {
-    const h = createHarness();
-    const res = await worker.fetch(new Request("https://broker.local/publish"), h.env, h.ctx);
-    expect(res.status).toBe(405);
-  });
-
-  it("accepts exactly POST /publish and POST /publish?force=1", async () => {
-    for (const query of ["", "?force=1"]) {
-      const h = createHarness({ FCIM_PAGE_API_URL: PAGE_API_URL });
-      const upstream = stubFetch(() => {
-        throw new Error("HTTP trigger must remain producer-only");
-      });
-
-      const res = await worker.fetch(
-        new Request(`https://broker.local/publish${query}`, { method: "POST", headers: AUTH }),
-        h.env,
-        h.ctx,
-      );
-      expect(res.status).toBe(202);
-      expect(await res.json()).toMatchObject({ outcome: "queued", stage: "discover", force: query !== "" });
-      expect(h.queue.ofKind("discover")).toHaveLength(1);
-      expect(upstream).not.toHaveBeenCalled();
+  it("405s a publisher route reached with the wrong method, before doing any work", async () => {
+    const cases: [string, string][] = [
+      ["/publications", "GET"],
+      ["/publisher/heartbeat", "POST"],
+      ["/publication-status", "POST"],
+    ];
+    for (const [path, method] of cases) {
+      const { res, h } = await request(path, method, PUBLISHER_AUTH);
+      expect(res.status).toBe(405);
+      expect(h.bucket.keys()).toEqual([]);
     }
+  });
+
+  it("404s a publication path whose snapshot id is not a snapshot id", async () => {
+    const { res } = await request("/publications/..%2F..%2Fcurrent.json", "GET", PUBLISHER_AUTH);
+    expect(res.status).toBe(404);
   });
 });
 
@@ -544,9 +541,7 @@ describe("E-08: Page API redirect safety", () => {
  * ------------------------------------------------------------------ */
 
 describe("publication job contract", () => {
-  const validIngest = {
-    schema_version: 1,
-    kind: "ingest_pdf",
+  const validFile = {
     snapshot_id: SNAPSHOT_ID,
     file_id: "f0",
     filename: "anul_i_semestrul_i-18.pdf",
@@ -554,28 +549,47 @@ describe("publication job contract", () => {
     r2_key: `snapshots/${SNAPSHOT_ID}/pdfs/anul_i_semestrul_i-18.pdf`,
   };
 
-  it("accepts a well-formed ingest job", () => {
-    expect(validateJob(validIngest).ok).toBe(true);
+  it("accepts a well-formed planned file", () => {
+    expect(validatePendingFile(validFile).ok).toBe(true);
   });
 
-  const bad: { name: string; job: unknown }[] = [
-    { name: "a foreign source_url", job: { ...validIngest, source_url: "https://evil.example/x.pdf" } },
+  const badFiles: { name: string; file: Parameters<typeof validatePendingFile>[0] }[] = [
+    { name: "a foreign source_url", file: { ...validFile, source_url: "https://evil.example/x.pdf" } },
     {
       name: "an r2_key pointing at another snapshot",
-      job: { ...validIngest, r2_key: "snapshots/other/pdfs/anul_i_semestrul_i-18.pdf" },
+      file: { ...validFile, r2_key: "snapshots/other/pdfs/anul_i_semestrul_i-18.pdf" },
     },
     {
       name: "a filename that disagrees with the source_url",
-      job: { ...validIngest, filename: "elsewhere.pdf", r2_key: `snapshots/${SNAPSHOT_ID}/pdfs/elsewhere.pdf` },
+      file: { ...validFile, filename: "elsewhere.pdf", r2_key: `snapshots/${SNAPSHOT_ID}/pdfs/elsewhere.pdf` },
     },
-    { name: "a traversal filename", job: { ...validIngest, filename: "../secret.pdf" } },
-    { name: "an invalid snapshot id", job: { ...validIngest, snapshot_id: "../.." } },
-    { name: "an unknown kind", job: { ...validIngest, kind: "delete_everything" } },
-    { name: "an unsupported schema version", job: { ...validIngest, schema_version: 2 } },
+    { name: "a traversal filename", file: { ...validFile, filename: "../secret.pdf" } },
+    { name: "an invalid snapshot id", file: { ...validFile, snapshot_id: "../.." } },
+    { name: "a non-string file id", file: { ...validFile, file_id: 0 } },
+  ];
+
+  for (const testCase of badFiles) {
+    it(`rejects ${testCase.name}`, () => {
+      expect(validatePendingFile(testCase.file).ok).toBe(false);
+    });
+  }
+
+  // The queue carries two kinds now. The two that could reach FCIM are refused on receipt.
+  it("accepts only finalize and reconcile jobs", () => {
+    expect(validateJob({ schema_version: 1, kind: "finalize", snapshot_id: SNAPSHOT_ID }).ok).toBe(true);
+    expect(validateJob({ schema_version: 1, kind: "reconcile" }).ok).toBe(true);
+  });
+
+  const badJobs: { name: string; job: unknown }[] = [
+    { name: "a retired discover job", job: { schema_version: 1, kind: "discover", force: false } },
+    { name: "a retired ingest job", job: { schema_version: 1, kind: "ingest_pdf", ...validFile } },
+    { name: "an unknown kind", job: { schema_version: 1, kind: "delete_everything" } },
+    { name: "an unsupported schema version", job: { schema_version: 2, kind: "reconcile" } },
+    { name: "a finalize job with a bad snapshot id", job: { schema_version: 1, kind: "finalize", snapshot_id: "../.." } },
     { name: "a non-object", job: "ingest everything" },
   ];
 
-  for (const testCase of bad) {
+  for (const testCase of badJobs) {
     it(`rejects ${testCase.name}`, () => {
       expect(validateJob(testCase.job).ok).toBe(false);
     });

@@ -117,6 +117,21 @@ export class MockR2Bucket implements R2Bucket {
     // must leave no object behind, exactly as R2 abandons a failed multipart upload.
     const bytes = await readValue(value);
 
+    // DF-05: R2 validates a declared content checksum server-side and rejects the write when the
+    // bytes disagree. Modelling that here is what makes "unverified bytes never become a final
+    // object" a testable property rather than an assumption about the client.
+    if (options?.sha256 !== undefined) {
+      const declared = typeof options.sha256 === "string"
+        ? options.sha256.toLowerCase()
+        : hex(new Uint8Array(options.sha256));
+      if (!/^[a-f0-9]{64}$/.test(declared)) {
+        throw new Error("put: The SHA-256 checksum you specified is not valid.");
+      }
+      if ((await sha256Hex(bytes)) !== declared) {
+        throw new Error("put: The SHA-256 checksum you specified did not match what we received.");
+      }
+    }
+
     const etag = crypto.randomUUID().replace(/-/g, "");
     const item: StoredObject = {
       data: bytes,
@@ -234,6 +249,15 @@ export class MockR2Bucket implements R2Bucket {
   }
 }
 
+function hex(bytes: Uint8Array): string {
+  return Array.from(bytes).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const view = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", view)));
+}
+
 async function readValue(
   value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob,
 ): Promise<Uint8Array> {
@@ -294,6 +318,9 @@ export class MockQueue implements Queue<PublicationJob> {
   }
 }
 
+/** A publisher credential that satisfies the deployed minimum length. */
+export const TEST_PUBLISHER_TOKEN = "md-publisher-token-0123456789abcdef";
+
 export function createExecutionContext(): ExecutionContext {
   return { waitUntil: () => {}, passThroughOnException: () => {} };
 }
@@ -315,6 +342,7 @@ export function createHarness(overrides: Partial<Env> = {}): WorkerHarness {
     PUBLICATION_QUEUE: queue,
     FCIM_EGRESS: egress,
     SCHEDULE_BROKER_SECRET: "test-secret",
+    MD_PUBLISHER_TOKEN: TEST_PUBLISHER_TOKEN,
     ...overrides,
   };
   return { env, bucket, queue, egress, ctx: createExecutionContext() };

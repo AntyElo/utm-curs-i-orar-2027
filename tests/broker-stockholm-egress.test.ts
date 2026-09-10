@@ -1,4 +1,11 @@
-/** Gate E.7 coverage for the private Stockholm HTTP Service Binding transport. */
+/**
+ * Gate E.7 coverage for the private Stockholm HTTP Service Binding transport, plus the Gate F
+ * property that supersedes it: the broker itself no longer makes upstream requests at all.
+ *
+ * The Stockholm backend and the broker's transport helpers are retained and still tested, but
+ * nothing in the deployed Worker routes to them any more. The last describe in this file is the
+ * one that matters operationally — no entry point may reach FCIM, directly or through the binding.
+ */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import stockholmEgressWorker from "../worker-egress/src/index";
@@ -13,18 +20,11 @@ import {
 } from "../worker-shared/fcim-policy";
 import { isRetryableUpstreamFailure } from "../worker/src/http";
 import worker from "../worker/src/index";
-import { pendingDescriptorKey, snapshotManifestKey, snapshotPageApiKey } from "../worker/src/keys";
 import { fetchPageApi, PageApiError } from "../worker/src/page-api";
 import { fetchOfficialPdf, PdfFetchError } from "../worker/src/pdf-fetch";
-import { runDiscovery, runPdfIngest } from "../worker/src/publisher";
-import type {
-  CurrentPointer,
-  IngestPdfJob,
-  PendingDescriptor,
-  ServiceBinding,
-  SnapshotManifest,
-} from "../worker/src/types";
+import type { ServiceBinding } from "../worker/src/types";
 import { createHarness, drainQueue } from "./helpers/worker-doubles";
+import { publishThroughApi } from "./helpers/md-publication";
 
 const PAGE_API_URL = CANONICAL_PAGE_API_URL;
 const PDF_URL =
@@ -288,80 +288,52 @@ describe("Stockholm backend PDF operation", () => {
   });
 });
 
-describe("main Worker HTTP Service Binding integration", () => {
-  it("runDiscovery uses FCIM_EGRESS.fetch and never global FCIM fetch", async () => {
-    const directFetch = upstreamFetch(() => {
-      throw new Error("main Worker attempted direct FCIM fetch");
+describe("Gate F: no broker entry point reaches FCIM", () => {
+  it("completes a whole publication without one upstream request", async () => {
+    const direct = upstreamFetch(() => {
+      throw new Error("the broker attempted a direct FCIM fetch");
     });
-    const binding = new StaticServiceBinding(
-      () =>
-        new Response(pagePayload([PDF_URL]), {
-          status: 200,
-          headers: serviceHeaders({ "Content-Type": "application/json" }),
-        }),
-    );
-    const h = createHarness({ FCIM_EGRESS: binding });
+    const h = createHarness({ FCIM_PAGE_API_URL: PAGE_API_URL });
 
-    const result = await runDiscovery(h.env);
+    const result = await publishThroughApi(h);
 
-    expect(result.outcome).toBe("scheduled");
-    expect(binding.requests).toHaveLength(1);
-    expect(binding.requests[0].url).toBe(`${FCIM_EGRESS_INTERNAL_ORIGIN}/page-api`);
-    expect(binding.requests[0].method).toBe("POST");
-    expect(await binding.requests[0].json()).toEqual({ schema_version: 1 });
-    expect(directFetch).not.toHaveBeenCalled();
+    expect(result.completeBody.status).toBe("published");
+    expect(direct).not.toHaveBeenCalled();
+    // The Stockholm binding is still wired up, and is still never used.
+    expect(h.egress.requests).toHaveLength(0);
   });
 
-  it("runPdfIngest uses FCIM_EGRESS.fetch and never global FCIM fetch", async () => {
-    const pageBinding = new StaticServiceBinding(
-      () =>
-        new Response(pagePayload([PDF_URL]), {
-          status: 200,
-          headers: serviceHeaders({ "Content-Type": "application/json" }),
-        }),
-    );
-    const h = createHarness({ FCIM_EGRESS: pageBinding });
-    const discovery = await runDiscovery(h.env);
-    const job = h.queue.ofKind("ingest_pdf")[0] as IngestPdfJob;
-    expect(discovery.outcome).toBe("scheduled");
-
-    const directFetch = upstreamFetch(() => {
-      throw new Error("Queue consumer attempted direct FCIM fetch");
+  it("performs no upstream request from cron or from the queue consumer", async () => {
+    const direct = upstreamFetch(() => {
+      throw new Error("a background invocation attempted a direct FCIM fetch");
     });
-    const pdfBinding = new StaticServiceBinding(
-      () =>
-        new Response(new TextEncoder().encode("%PDF-service"), {
-          status: 200,
-          headers: serviceHeaders({
-            "Content-Type": "application/pdf",
-            "Content-Length": "12",
-          }),
-        }),
-    );
-    h.env.FCIM_EGRESS = pdfBinding;
+    const h = createHarness({ FCIM_PAGE_API_URL: PAGE_API_URL });
 
-    const result = await runPdfIngest(h.env, job);
+    await worker.scheduled({ cron: "*/20 * * * *", type: "scheduled", scheduledTime: Date.now() }, h.env, h.ctx);
+    expect(h.queue.sent).toEqual([{ schema_version: 1, kind: "reconcile" }]);
 
-    expect(result.outcome).toBe("ingested");
-    expect(pdfBinding.requests).toHaveLength(1);
-    expect(pdfBinding.requests[0].url).toBe(`${FCIM_EGRESS_INTERNAL_ORIGIN}/pdf`);
-    expect(await pdfBinding.requests[0].json()).toEqual({ schema_version: 1, target_url: PDF_URL });
-    expect(directFetch).not.toHaveBeenCalled();
+    const drain = await drainQueue(h, worker.queue);
+    expect(drain.retried).toBe(0);
+    expect(drain.deadLettered).toBe(0);
+    expect(direct).not.toHaveBeenCalled();
+    expect(h.egress.requests).toHaveLength(0);
   });
 
-  for (const status of [403, 429, 500]) {
-    it(`keeps backend HTTP ${status} retryable for 300 seconds without pointer advancement`, async () => {
-      const h = createHarness();
-      upstreamFetch(() => new Response(null, { status }));
-      await h.queue.send({ schema_version: 1, kind: "discover", force: false });
-
-      const result = await drainQueue(h, worker.queue, { maxDeliveries: 1 });
-
-      expect(result.retried).toBe(1);
-      expect(result.retryDelays).toEqual([300]);
-      expect(h.bucket.has("current.json")).toBe(false);
+  it("acks a surviving pre-cutover acquisition job without executing it", async () => {
+    const direct = upstreamFetch(() => {
+      throw new Error("a retired job reached the network");
     });
-  }
+    const h = createHarness({ FCIM_PAGE_API_URL: PAGE_API_URL });
+    await h.queue.send({ schema_version: 1, kind: "discover", force: false } as never);
+
+    const result = await drainQueue(h, worker.queue, { maxDeliveries: 4 });
+
+    expect(result.acked).toBe(1);
+    expect(result.retried).toBe(0);
+    expect(direct).not.toHaveBeenCalled();
+    expect(h.egress.requests).toHaveLength(0);
+    expect(h.bucket.has("current.json")).toBe(false);
+  });
 
   it("keeps invalid URLs deterministic and outside the Service Binding", async () => {
     const h = createHarness();
@@ -372,49 +344,6 @@ describe("main Worker HTTP Service Binding integration", () => {
     expect(error).toBeInstanceOf(PdfFetchError);
     expect(isRetryableUpstreamFailure(error)).toBe(false);
     expect(h.egress.requests).toHaveLength(0);
-  });
-
-  it("runs discovery, streamed PDF ingest, finalize, and strict CAS through the backend", async () => {
-    const secondPdf =
-      "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/orar-anul-ii-curent.pdf";
-    const h = createHarness({ FCIM_PAGE_API_URL: PAGE_API_URL });
-    upstreamFetch((url) => {
-      if (url === PAGE_API_URL) {
-        return new Response(pagePayload([PDF_URL, secondPdf]), {
-          status: 200,
-          headers: { "Content-Type": "application/json", ETag: '"page-current"' },
-        });
-      }
-      const bytes = new TextEncoder().encode(`%PDF-${url.endsWith("ii-curent.pdf") ? "II" : "I"}`);
-      return new Response(bytes, {
-        status: 200,
-        headers: { "Content-Type": "application/pdf", "Content-Length": String(bytes.byteLength) },
-      });
-    });
-
-    const trigger = await worker.fetch(
-      new Request("https://broker.local/publish?force=1", {
-        method: "POST",
-        headers: { Authorization: "Bearer test-secret" },
-      }),
-      h.env,
-      h.ctx,
-    );
-    expect(trigger.status).toBe(202);
-    expect((await drainQueue(h, worker.queue)).retried).toBe(0);
-
-    const pointer = h.bucket.json<CurrentPointer>("current.json")!;
-    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(pointer.snapshot_id))!;
-    const manifest = h.bucket.json<SnapshotManifest>(snapshotManifestKey(pointer.snapshot_id))!;
-    expect(pointer).toMatchObject({ schema_version: 1, pdf_count: 2 });
-    expect(h.bucket.has(snapshotPageApiKey(pointer.snapshot_id))).toBe(true);
-    expect(descriptor.files).toHaveLength(2);
-    expect(manifest.files).toHaveLength(2);
-    expect(h.egress.requests.map((request) => new URL(request.url).pathname)).toEqual([
-      "/page-api",
-      "/pdf",
-      "/pdf",
-    ]);
   });
 });
 

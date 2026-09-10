@@ -7,6 +7,13 @@
  * the whole body in memory.
  */
 
+export class ContentPrefixError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ContentPrefixError";
+  }
+}
+
 export class PayloadTooLargeError extends Error {
   readonly maxBytes: number;
   constructor(maxBytes: number) {
@@ -77,6 +84,53 @@ async function readWithinLimit(
     offset += chunk.byteLength;
   }
   return body;
+}
+
+/** The five bytes every PDF starts with. */
+export const PDF_MAGIC = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]); // "%PDF-"
+
+/**
+ * Wrap a body stream so it errors unless it begins with the expected magic bytes.
+ *
+ * The check runs on the first bytes off the wire and holds nothing back, so a body that lies
+ * about its type fails before R2 is ever asked to create an object from it. A body shorter than
+ * the prefix fails too — a truncated upload is not a PDF either.
+ */
+export function requirePrefix(
+  source: ReadableStream<Uint8Array>,
+  prefix: Uint8Array,
+  label: string,
+): ReadableStream<Uint8Array> {
+  let matched = 0;
+  const guard = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      for (let i = 0; matched < prefix.length && i < chunk.byteLength; i++, matched++) {
+        if (chunk[i] !== prefix[matched]) {
+          controller.error(new ContentPrefixError(`Body does not start with the expected ${label} signature`));
+          return;
+        }
+      }
+      controller.enqueue(chunk);
+    },
+    flush(controller) {
+      if (matched < prefix.length) {
+        controller.error(new ContentPrefixError(`Body is shorter than the expected ${label} signature`));
+      }
+    },
+  });
+  return source.pipeThrough(guard);
+}
+
+/** True when the error (or any cause in its chain) is a content-signature rejection. */
+export function isContentPrefixError(error: unknown): boolean {
+  let cursor: unknown = error;
+  for (let depth = 0; depth < 5 && cursor; depth++) {
+    if (cursor instanceof ContentPrefixError) return true;
+    const message = (cursor as { message?: unknown }).message;
+    if (typeof message === "string" && message.includes("expected PDF signature")) return true;
+    cursor = (cursor as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 /** Parse an exact, usable Content-Length value; malformed or absent claims stay unknown. */

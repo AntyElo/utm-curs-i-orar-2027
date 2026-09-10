@@ -135,7 +135,8 @@ answers a Worker at the edge. So an optional broker stands between them: a Worke
 official timetable PDFs into immutable R2 snapshots, and stores the accepted state Render produces.
 
 ```
-FCIM ──▶ Cloudflare Worker ──▶ R2 candidate snapshots ──▶ Render semantic selection /
+FCIM ──▶ MD Publisher (laptop) ──▶ Cloudflare Worker ──▶ R2 candidate snapshots ──▶
+                                                          Render semantic selection /
                                                           parser / validator
                                                                   │
                                                                   ▼
@@ -144,6 +145,10 @@ FCIM ──▶ Cloudflare Worker ──▶ R2 candidate snapshots ──▶ Rend
 
 The division of labour is strict and is the reason the broker can stay this simple:
 
+  - **The laptop is transport-only.** It may fetch the Page API, discover official PDF URLs,
+    download and hash raw bytes, upload them, and write a heartbeat. It may not parse timetable
+    semantics, make acceptance decisions, choose an R2 key, a filename, a snapshot id or an
+    accepted id, or write `current.json`, `accepted/*` or `accepted-payloads/*`.
   - **The Worker is a transport.** It mirrors *every* strictly-valid official timetable PDF the
     authoritative page references. It does not read a course year, semester, revision or
     "master vs licență" out of a filename — a filename filter cannot be semantically complete, and
@@ -152,73 +157,112 @@ The division of labour is strict and is the reason the broker can stay this simp
     snapshot's own archived `page-api.json`, so selection is reproducible from the snapshot alone,
     and the file it picks must be present in that snapshot's manifest or the update is rejected.
 
-### Split publication
+### Staged publication (Gate F)
 
-A Worker on the Cloudflare Free plan gets 10 ms of CPU per invocation. Fetching six PDFs
-(~4.3 MB) and closing a snapshot in one invocation measured 11–14 ms, so publication is four
-bounded stages, one invocation each, joined by a Cloudflare Queue with a batch size of one:
+Cloudflare's edge cannot reach fcim.utm.md reliably, so the broker no longer fetches anything.
+A transport-only client on a laptop in Moldova — the **MD Publisher** — is the only thing that
+talks to FCIM. It hands the broker raw bytes over an authenticated credential; the broker derives
+everything that matters from those bytes with the same code the retired discovery stage used.
 
 ```
-cron (*/20) or authenticated POST /publish   producer-only; enqueue discovery
+MD Publisher (Moldova laptop)          Broker Worker                      Render
+  read current.json + its manifest ──▶ the authoritative freshness baseline
+  fetch Page API (canonical URL)
+  conditionally revalidate each PDF
+  broker already serving it? ──▶ heartbeat, exit 0
   │
-  ▼
-DISCOVERY            one Queue invocation
-  ├─ read current.json, parse the strict or exact legacy shape, keep its ETag as the CAS token
-  ├─ load legacy Page/PDF validators from that pointer's immutable manifest (never fabricate them)
-  ├─ call `FCIM_EGRESS.fetch()` through the private HTTP Service Binding
-  ├─ Stockholm backend fetch handler GETs the exact Page API (manual redirect — always refused)
-  ├─ unchanged?  modified_gmt equal + same PDF catalogue + every mirrored PDF 304  ──▶ stop
-  ├─ write snapshots/<id>/page-api.json          (create-only)
-  ├─ write pending/<id>/descriptor.json          (create-only; fixes the expected file set)
-  └─ enqueue one ingest job per PDF + a backstop finalize
+  ├─ POST /publications ─────────────▶ re-read the page, re-extract the PDF catalogue,
+  │    X-Publication-Operation-Id       plan filenames/keys, temporal guards, open cap
+  │    X-Page-Sha256                    ├─ write operations/<operation-id>.json   (create-only)
+  │    body: raw Page API bytes         ├─ write snapshots/<id>/page-api.json     (create-only)
+  │                                     └─ write pending/<id>/descriptor.json     (create-only)
+  │  ◀──────────────────────────────── broker-generated plan (snapshot id, file ids, upload paths)
   │
-  ▼
-PDF INGEST           one invocation per PDF
-  ├─ re-validate the job against the descriptor
-  ├─ call the same Service Binding with the descriptor's dynamic official PDF URL
-  ├─ Stockholm backend streams the PDF (every redirect is re-checked against the shared policy)
-  ├─ stream the body into snapshots/<id>/pdfs/<file>   (create-only, byte-capped)
-  ├─ write pending/<id>/completed/<file-id>.json       (create-only)
-  └─ enqueue a finalize
+  ├─ PUT /publications/<id>/files/<f> ▶ resolve <f> against the descriptor, verify %PDF-,
+  │    X-Content-Sha256                  exact Content-Length and the declared digest
+  │    body: one PDF, streamed           ├─ R2 put with server-side sha256      (create-only)
+  │                                      └─ pending/<id>/completed/<f>.json     (create-only)
   │
-  ▼
-FINALIZE             one invocation
-  ├─ every descriptor file present, every completion marker present?  no ──▶ incomplete, stop
-  ├─ write snapshots/<id>/manifest.json          (create-only)
-  └─ CAS current.json against the ETag discovery read                  ── LAST
+  └─ POST /publications/<id>/complete ▶ page provenance still agrees with the descriptor?
+                                        ├─ write snapshots/<id>/manifest.json   (create-only)
+                                        └─ CAS current.json against the observed ETag  ── LAST
+                                                                                  │
+                                                                                  ▼
+                                                                    download, hash, parse,
+                                                                    validate, accept
 ```
 
 `current.json` may name a snapshot only when its `page-api.json`, every descriptor file, every
 completion marker and its manifest all exist and agree, so a half-built snapshot is not a risk —
-it is simply never pointed at. A cycle that loses the CAS to a newer publisher leaves its snapshot
-behind as harmless history rather than overwriting anything.
+it is simply never pointed at. A publication that loses the CAS to a newer one leaves its snapshot
+behind as harmless history rather than overwriting anything, and `superseded` is a normal,
+successful outcome for the publisher.
 
-Every stage is safe to run twice. Snapshot children are created with `If-None-Match: *`, so a
-redelivered ingest job either finds its own object already there (success) or finds someone else's
-(failure — never an overwrite); a redelivered finalize that sees `current.json` already naming its
-snapshot reports success without touching it. Completion is recorded as one immutable marker per
-file rather than a shared counter, because two concurrent ingests can lose an update to a counter
-and cannot lose disjoint keys.
+Every step is safe to repeat. Snapshot children are created with `If-None-Match: *`, so a repeated
+upload either finds its own object already there (success) or finds different content (409, never
+an overwrite); a repeated completion that sees `current.json` already naming its snapshot reports
+success without touching it. Completion is recorded as one immutable marker per file rather than a
+shared counter, because two concurrent uploads can lose an update to a counter and cannot lose
+disjoint keys.
 
-`fcim-stockholm-egress` is a second, internal-only Worker configured with
-`placement.region = "aws:eu-north-1"`, `workers_dev = false`, no route, and no custom domain. The
-broker reaches its default fetch handler only through an HTTP Service Binding. Its two private POST
-operations permit only the canonical Page API and strict official upload URLs. It forwards only
-content type/length, validators, last-modified, and safe placement/ray diagnostics, and returns PDF
-bodies as streams. All descriptor, R2, Queue, manifest, CAS, parsing, selection, and accepted-state
-responsibilities remain in the broker or Render.
+**Publication identity is the client's UUIDv4, not the page hash.** FCIM does replace a timetable
+PDF in place under an unchanged URL without touching the page, so two different publications can
+legitimately carry byte-identical Page API payloads. Keying identity on the payload would make that
+change unpublishable. `operations/<operation-id>.json` binds one attempt to one snapshot, is
+create-only, and is written before any snapshot state:
 
-Failures are visible rather than absorbed. The queue processes one message at a time, retries at
-most three times, waits 300 seconds between retryable attempts, and sends exhausted messages to
-`fcim-broker-publication-dlq`. Network failures and upstream 403, 429 and 5xx responses are
-retryable; malformed jobs, invalid immutable state and security-policy rejections are logged and
-acknowledged because another attempt cannot change them. A snapshot left unfinished is re-driven
-by a reconciliation pass the cron queues each tick, which re-enqueues only the ingest jobs whose
-completion markers are missing and whose recorded `current.json` ETag can still win the CAS.
-Already-superseded or aged-out SEA-era pending snapshots therefore cause no new FCIM traffic. A
-Page API redirect or other deterministic failure is still an
-error — the previous `current.json` is left exactly as it was. Only a genuine 304 (or an unchanged
-`modified_gmt` with an unchanged catalogue and unchanged PDFs) means "unchanged".
+| Situation | Answer | Publisher's response |
+| --- | --- | --- |
+| Same id, same page bytes | resume the same publication | continue where it left off |
+| Same id, different page bytes | `409 operation_payload_mismatch`, zero mutation, snapshot id withheld | discard, mint a new id, retry once |
+| Record present, descriptor gone | `410 operation_expired` | discard, mint a new id, retry once |
+| Record and descriptor disagree | `409 operation_state_corrupt` | never retry; heartbeat the error and exit non-zero |
+
+**Temporal guards.** At open, the incoming `modified_gmt` is compared with the current snapshot's.
+Older is `409 stale_page`; missing-while-a-baseline-exists is `409 stale_page`; more than
+`MAX_PAGE_FUTURE_SKEW_HOURS` (default 26) ahead of broker time is `400 future_page`. **Equal is
+valid** — that is how an in-place PDF replacement gets published. There is no force query, header
+or CLI flag anywhere in the system.
+
+**A publisher-observed validator is never a trusted one.** Render may skip a candidate download
+only on evidence the broker vouches for, so MD-published manifest files carry
+`upstream_etag: null` and `upstream_last_modified: null` unconditionally, whatever a completion
+marker claims. What the laptop saw is recorded separately as `publisher_observed_etag`,
+`publisher_observed_last_modified` and `content_sha256`, which nothing on Render reads. A laptop
+that claims "ETag unchanged" while shipping different bytes therefore cannot freeze the timetable
+Render serves; Render downloads, hashes, and only actual hash equality produces "unchanged".
+
+**The laptop's memory is never the freshness baseline.** The only authoritative answer to "is the
+broker up to date" is the snapshot `current.json` names, so every run reads that pointer and, when
+it has to, the snapshot's own immutable manifest — which carries the SHA-256 of every mirrored PDF.
+The laptop's `last-run.json` is a cache of that answer and is ignored unless it records the id of
+the snapshot the broker is serving at this moment. This is what keeps a lost pointer race from
+becoming a permanent stall: a publication that completes as `superseded` has no claim on the
+baseline, so the laptop re-reads what actually won, sees that FCIM still disagrees with it, and
+publishes again. For the same reason a resumed publication records the bytes the broker stored
+rather than any newer revision it happened to see while finishing, and a file the plan already
+reports as `stored` is not re-downloaded at all. Deleting the state directory, or moving to a
+different laptop entirely, costs one extra publication and never costs freshness.
+
+**No background invocation reaches FCIM.** `POST /publish` is gone, and so are the `discover` and
+`ingest_pdf` job kinds — a surviving message of either kind fails job validation and is
+acknowledged without executing. Cron enqueues reconciliation only. `runReconcile()` re-drives
+`finalize` for publications that are still inside their six-hour window and whose observed
+`current.json` ETag can still win the CAS, and runs bounded retention; it never asks anyone for
+bytes. A publication missing an upload is left for the publisher to resume.
+
+`fcim-stockholm-egress`, `worker/src/pdf-fetch.ts`, `fetchPageApi()` and the `FCIM_EGRESS` service
+binding remain in the repository and remain tested, but nothing in the deployed Worker routes to
+them any more. They are Stage-2 cleanup, deliberately not removed in the same change as the
+functional cutover.
+
+Failures are visible rather than absorbed. The queue still processes one message at a time, retries
+at most three times, waits 300 seconds between retryable attempts, and sends exhausted messages to
+`fcim-broker-publication-dlq`. A publisher-side failure is never "unchanged": an FCIM 403, timeout
+or redirect makes the run exit non-zero with the previous `current.json` untouched, and every
+completed run — quiet ones included — writes a heartbeat, so a laptop that has silently stopped
+reaching FCIM does not look like a calm upstream. A heartbeat that cannot be delivered is logged
+and nothing more: losing an observation about a transaction must not corrupt the transaction.
 
 ### Accepted state and durable transaction ordering
 

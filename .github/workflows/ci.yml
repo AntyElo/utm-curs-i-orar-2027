@@ -28,6 +28,14 @@ jobs:
 
       - run: npm run typecheck
 
+      # The broker Worker and the MD Publisher are separate TypeScript projects with their own
+      # compiler settings. Without these steps they can only break at deploy time.
+      - run: npm run typecheck:worker
+
+      - run: npm run typecheck:publisher
+
+      - run: npm run build:publisher
+
       - run: npm run lint
 
       # Parser, updater and API smoke suites. They read bundled PDF fixtures and stub

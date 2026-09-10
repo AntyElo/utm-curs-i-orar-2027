@@ -10,6 +10,18 @@ export const CURRENT_KEY = "current.json";
 
 export const SNAPSHOT_PREFIX = "snapshots/";
 export const PENDING_PREFIX = "pending/";
+export const OPERATION_PREFIX = "operations/";
+
+/** Publisher liveness. The one small mutable object outside `current.json`. */
+export const PUBLISHER_HEARTBEAT_KEY = "publisher/heartbeat.json";
+
+/**
+ * Create-only binding from one client publication attempt to one broker snapshot.
+ * The id is a client-generated UUIDv4 and is validated before it ever reaches this function.
+ */
+export function operationKey(operationId: string): string {
+  return `${OPERATION_PREFIX}${operationId}.json`;
+}
 
 export function snapshotPageApiKey(snapshotId: string): string {
   return `${SNAPSHOT_PREFIX}${snapshotId}/page-api.json`;

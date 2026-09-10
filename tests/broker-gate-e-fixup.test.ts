@@ -2,13 +2,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { isOfficialTimetablePdfUrl, isSafeOfficialPdfFilename, MAX_OFFICIAL_PDF_FILENAME_LENGTH } from "../worker-shared/fcim-policy";
 import { extractOfficialPdfUrls } from "../worker/src/extractor";
 import worker from "../worker/src/index";
-import { buildIngestJob, validateJob } from "../worker/src/jobs";
+import { validatePendingFile } from "../worker/src/jobs";
 import { pendingCompletionKey, pendingDescriptorKey, snapshotManifestKey, snapshotPageApiKey } from "../worker/src/keys";
 import { GC_MAX_OBJECTS_PER_PREFIX, GC_MAX_PREFIX_DELETIONS, GC_PREFIXES_PER_NAMESPACE, RECONCILE_SCAN_PAGES, RETENTION_AGE_MS, runRetention, snapshotIdInstant } from "../worker/src/maintenance";
 import { buildCurrentPointer } from "../worker/src/pointer";
-import { generateSnapshotId, planSnapshotFiles, runDiscovery, runFinalize, runPdfIngest, runReconcile } from "../worker/src/publisher";
+import { generateSnapshotId, planSnapshotFiles, runFinalize, runReconcile } from "../worker/src/publisher";
 import type { PendingDescriptor } from "../worker/src/types";
 import { createHarness, drainQueue, type WorkerHarness } from "./helpers/worker-doubles";
+import { openPublication, pagePayload, publishThroughApi, uploadPublicationFile } from "./helpers/md-publication";
 
 const BASE = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/";
 const HOUR = 60 * 60 * 1000;
@@ -22,6 +23,7 @@ function seedPending(h: WorkerHarness, id: string, etag: string | null = null): 
   const descriptor: PendingDescriptor = {
     schema_version: 1, snapshot_id: id, previous_snapshot_id: null,
     created_at: new Date().toISOString(), current_etag: etag,
+    operation_id: crypto.randomUUID(), page_api_sha256: "0".repeat(64), origin: "md_publisher",
     source: { page_api_url: "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view",
       page_id: 1739, page_modified_gmt: null, retrieved_at: new Date().toISOString(), etag: null, last_modified: null },
     files: planSnapshotFiles(id, [BASE + "a.PDF", BASE + "b.Pdf"]),
@@ -68,8 +70,7 @@ describe("GE-N01 canonical filename policy", () => {
     const files = planSnapshotFiles(id, [...urls, url.replace("/09/", "/08/")]);
     for (const file of files) {
       expect(file.filename.length).toBeLessThanOrEqual(MAX_OFFICIAL_PDF_FILENAME_LENGTH);
-      const job = buildIngestJob({ snapshotId: id, fileId: file.file_id, filename: file.filename, sourceUrl: file.source_url });
-      expect(validateJob(job).ok).toBe(true);
+      expect(validatePendingFile({ snapshot_id: id, ...file }).ok).toBe(true);
       h.bucket.seed(file.r2_key, "%PDF-1.4");
       expect((await worker.fetch(new Request(`https://broker/snapshots/${id}/pdfs/${file.filename}`), h.env, h.ctx)).status).toBe(200);
     }
@@ -86,14 +87,13 @@ describe("GE-N01 canonical filename policy", () => {
     expect(extractOfficialPdfUrls(`<a href="${BASE}a.PDF${suffix}">pdf</a>`)).toEqual([]);
   });
 
-  it("publishes uppercase and boundary-length files through the actual queue", async () => {
-    mockUpstream(["a.PDF", "m".repeat(191) + ".Pdf"]);
+  it("publishes uppercase and boundary-length files through the publisher API", async () => {
     const h = createHarness();
-    const result = await runDiscovery(h.env);
-    expect(result.outcome).toBe("scheduled");
-    const drain = await drainQueue(h, worker.queue);
-    expect(drain.retried).toBe(0);
-    expect(h.bucket.json<{ snapshot_id: string }>("current.json")?.snapshot_id).toBe(result.snapshot_id);
+    const names = ["a.PDF", "m".repeat(191) + ".Pdf"];
+    const result = await publishThroughApi(h, { page: pagePayload({ urls: names.map((name) => BASE + name) }) });
+    expect(result.completeBody.status).toBe("published");
+    expect(result.plan.files.map((file) => file.filename)).toEqual(names);
+    expect(h.bucket.json<{ snapshot_id: string }>("current.json")?.snapshot_id).toBe(result.snapshotId);
   });
 
   it("rejects deterministic descriptor/job mismatch at snapshot level without poison requeue", async () => {
@@ -107,7 +107,7 @@ describe("GE-N01 canonical filename policy", () => {
     expect(h.queue.sent).toHaveLength(0);
     expect(diagnostic).toHaveBeenCalledWith(expect.stringContaining("deterministically failed"));
     expect(await runFinalize(h.env, id)).toMatchObject({ outcome: "error", retryable: false,
-      error: expect.stringContaining("valid ingest job") });
+      error: expect.stringContaining("invalid file entry") });
     expect(h.bucket.has("current.json")).toBe(false);
   });
 });
@@ -175,19 +175,21 @@ describe("GE-N02 incremental retention", () => {
 
   it("checks expiry again after manifest creation and before current CAS", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
-    mockUpstream(["a.PDF"]);
     const h = createHarness();
-    const discovery = await runDiscovery(h.env);
-    for (const job of h.queue.sent) if (job.kind === "ingest_pdf") await runPdfIngest(h.env, job);
+    const page = pagePayload({ urls: [BASE + "a.PDF"] });
+    const plan = await (await openPublication(h, page)).json() as { snapshot_id: string; files: { file_id: string }[] };
+    for (const file of plan.files) {
+      await uploadPublicationFile(h, plan.snapshot_id, file.file_id, new TextEncoder().encode("%PDF-1.4 body"));
+    }
     const put = h.bucket.put.bind(h.bucket);
     vi.spyOn(h.bucket, "put").mockImplementation(async (key, value, options) => {
       const result = await put(key, value, options);
-      if (key === snapshotManifestKey(discovery.snapshot_id!)) vi.setSystemTime(Date.now() + 7 * HOUR);
+      if (key === snapshotManifestKey(plan.snapshot_id)) vi.setSystemTime(Date.now() + 7 * HOUR);
       return result;
     });
-    expect(await runFinalize(h.env, discovery.snapshot_id!)).toMatchObject({ outcome: "error", retryable: false });
+    expect(await runFinalize(h.env, plan.snapshot_id)).toMatchObject({ outcome: "error", retryable: false });
     expect(h.bucket.has("current.json")).toBe(false);
-    expect(h.bucket.has(snapshotManifestKey(discovery.snapshot_id!))).toBe(true);
+    expect(h.bucket.has(snapshotManifestKey(plan.snapshot_id))).toBe(true);
   });
 
   it("abandons a sweep if current changes while loading the retained history", async () => {
@@ -203,14 +205,15 @@ describe("GE-N02 incremental retention", () => {
     expect(h.bucket.deletions).toHaveLength(0);
   });
 
-  it("refuses expired ingest/finalize even while the predecessor ETag could still match", async () => {
+  it("refuses expired upload/finalize even while the predecessor ETag could still match", async () => {
     const h = createHarness();
     const id = idAt(7);
     const descriptor = seedPending(h, id);
     const file = descriptor.files[0];
     const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
-    expect(await runPdfIngest(h.env, buildIngestJob({ snapshotId: id, fileId: file.file_id, filename: file.filename, sourceUrl: file.source_url })))
-      .toMatchObject({ outcome: "error", retryable: false, error: expect.stringContaining("expired") });
+    const upload = await uploadPublicationFile(h, id, file.file_id, new TextEncoder().encode("%PDF-1.4 body"));
+    expect(upload.status).toBe(410);
+    expect(h.bucket.has(file.r2_key)).toBe(false);
     expect(await runFinalize(h.env, id)).toMatchObject({ outcome: "error", retryable: false });
     expect(fetch).not.toHaveBeenCalled();
     expect(h.bucket.has("current.json")).toBe(false);
@@ -218,13 +221,13 @@ describe("GE-N02 incremental retention", () => {
 
   it("bounds retained storage under repeated real publications after sufficient GC cycles", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
-    mockUpstream(["a.PDF"]);
     const h = createHarness();
     const start = Date.now();
+    const page = pagePayload({ urls: [BASE + "a.PDF"] });
     for (let n = 0; n < 35; n++) {
       vi.setSystemTime(start + n * RETENTION_AGE_MS);
-      expect((await runDiscovery(h.env)).outcome).toBe("scheduled");
-      await drainQueue(h, worker.queue);
+      const result = await publishThroughApi(h, { page });
+      expect(result.completeBody.status).toBe("published");
       await runReconcile(h.env);
     }
     vi.setSystemTime(Date.now() + 2 * RETENTION_AGE_MS);
@@ -235,20 +238,19 @@ describe("GE-N02 incremental retention", () => {
     expect(pending.size).toBeLessThanOrEqual(1);
   });
 
-  it("keeps last-known-good and bounds retries and storage for permanently broken upstream", async () => {
+  it("keeps last-known-good and bounds storage when the publisher can never finish a publication", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const h = createHarness();
-    mockUpstream(["a.PDF"]);
-    await runDiscovery(h.env); await drainQueue(h, worker.queue);
+    const page = pagePayload({ urls: [BASE + "a.PDF"] });
+    await publishThroughApi(h, { page });
     const before = h.bucket.text("current.json");
-    mockUpstream(["a.PDF"], 503);
     for (let n = 0; n < 15; n++) {
       vi.setSystemTime(Date.now() + 2 * HOUR);
-      await runDiscovery(h.env, { force: true });
-      const drain = await drainQueue(h, worker.queue);
-      expect(drain.retried).toBeLessThanOrEqual(4);
+      // The laptop opens a publication and then dies before it can upload anything.
+      expect((await openPublication(h, page)).status).toBe(201);
       await runReconcile(h.env);
-      await drainQueue(h, worker.queue);
+      const drain = await drainQueue(h, worker.queue);
+      expect(drain.retried).toBe(0);
     }
     vi.setSystemTime(Date.now() + 2 * RETENTION_AGE_MS);
     for (let n = 0; n < 30; n++) await runReconcile(h.env);
@@ -259,7 +261,7 @@ describe("GE-N02 incremental retention", () => {
 });
 
 describe("GE-N03 cursor-aware reconciliation", () => {
-  it("finds later-page repairable work beyond 150 old prefixes, skips newer superseded work and requeues only missing work", async () => {
+  it("finds later-page repairable work beyond 150 old prefixes, skips newer superseded work and requeues finalize only", async () => {
     const h = createHarness();
     h.bucket.listPageSize = 60;
     const repairable = idAt(1);
@@ -269,11 +271,9 @@ describe("GE-N03 cursor-aware reconciliation", () => {
     // Reverse insertion order deliberately differs from R2's ordering.
     for (let n = 170; n > 0; n--) seedPending(h, idAt(12, n));
     const result = await runReconcile(h.env);
-    expect(result).toMatchObject({ outcome: "requeued", requeued_ingests: 1, requeued_finalizes: 1 });
-    expect(h.queue.sent).toEqual([
-      expect.objectContaining({ kind: "ingest_pdf", snapshot_id: repairable, file_id: "f1" }),
-      expect.objectContaining({ kind: "finalize", snapshot_id: repairable }),
-    ]);
+    expect(result).toMatchObject({ outcome: "requeued", requeued_finalizes: 1 });
+    // Gate F: reconciliation never asks for bytes. Missing uploads are the publisher's to resend.
+    expect(h.queue.sent).toEqual([expect.objectContaining({ kind: "finalize", snapshot_id: repairable })]);
     const scans = h.bucket.listings.filter((call) => call.limit === 100);
     expect(scans).toHaveLength(3);
     expect(scans[0].cursor).toBeUndefined();

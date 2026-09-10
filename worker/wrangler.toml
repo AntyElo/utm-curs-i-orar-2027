@@ -36,3 +36,12 @@ crons = ["*/20 * * * *"]
 [vars]
 FCIM_PAGE_API_URL = "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view"
 SCHEDULE_PAGE_URL = "https://fcim.utm.md/procesul-de-studii/orar/"
+# DF-03: how far an uploaded Page API `modified_gmt` may lead broker time before it is refused.
+MAX_PAGE_FUTURE_SKEW_HOURS = "26"
+
+# Secrets (wrangler secret put), never committed:
+#   SCHEDULE_BROKER_SECRET       Render's accepted-state credential
+#   MD_PUBLISHER_TOKEN           the Moldova laptop's transport credential (>= 32 chars)
+#   MD_PUBLISHER_TOKEN_PREVIOUS  rotation only; remove once the laptop uses the new value
+# MD_PUBLISHER_TOKEN must differ from SCHEDULE_BROKER_SECRET: if they are equal the publisher
+# routes fail closed rather than granting a transport credential accepted-state authority.

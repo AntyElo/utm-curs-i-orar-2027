@@ -1,89 +1,47 @@
 /**
- * Audit E-02 / NR-A regression suite: split candidate publication.
+ * Audit E-02 / NR-A regression suite: staged candidate publication.
  *
- * Publication is four bounded stages joined by a queue, so the properties worth pinning down are
- * the ones that hold *between* invocations: discovery never publishes, an unfinished snapshot
- * never becomes current, every stage is safe to run twice, and a stale finalize loses the CAS.
+ * Gate F replaced the queue-driven acquisition stages with authenticated MD Publisher uploads,
+ * but the properties worth pinning down are unchanged and are still the ones that hold *between*
+ * requests: opening a publication never publishes, an unfinished publication never becomes
+ * current, every step is safe to repeat, and a stale completion loses the CAS.
+ *
+ * NR-A is the reason this file exists: the broker mirrors every strictly-valid official timetable
+ * PDF the authoritative page references, including names it cannot interpret, because
+ * `discoverPdf()` on Render is the only thing allowed to decide what a timetable means.
  */
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../worker/src/index";
 import { pendingCompletionKey, pendingDescriptorKey, snapshotManifestKey, snapshotPageApiKey } from "../worker/src/keys";
-import { buildDiscoverJob, buildIngestJob } from "../worker/src/jobs";
 import { parseCurrentPointer } from "../worker/src/pointer";
-import { runDiscovery, runFinalize, runPdfIngest, runReconcile } from "../worker/src/publisher";
-import type {
-  CompletionMarker,
-  IngestPdfJob,
-  PendingDescriptor,
-  PublicationJob,
-  QueueMessageBatch,
-  SnapshotManifest,
-} from "../worker/src/types";
+import { runFinalize, runReconcile } from "../worker/src/publisher";
+import type { CompletionMarker, PendingDescriptor, SnapshotManifest } from "../worker/src/types";
+import {
+  completePublication,
+  openPublication,
+  pagePayload,
+  pdfBody,
+  publishThroughApi,
+  uploadPublicationFile,
+  UPLOAD_BASE,
+  type PlanResponse,
+} from "./helpers/md-publication";
 import { createHarness, drainQueue, type WorkerHarness } from "./helpers/worker-doubles";
 
 const PAGE_API_URL = "https://fcim.utm.md/wp-json/wp/v2/pages?slug=orar&context=view";
-const UPLOAD_BASE = "https://fcim.utm.md/wp-content/uploads/sites/24/2026/09";
+const PDF_BODY = pdfBody("shared");
 
-const PDF_BODY = new TextEncoder().encode("%PDF-1.4 fake timetable body");
-
-interface PageOptions {
-  modifiedGmt?: string;
-  filenames?: string[];
-  etag?: string | null;
-}
-
-function pagePayload(options: PageOptions = {}): string {
-  const filenames = options.filenames ?? ["anul_i_semestrul_i-19.pdf", "anul_ii_semestrul_iii-13.pdf"];
-  const anchors = filenames.map((name) => `<a href="${UPLOAD_BASE}/${name}">${name}</a>`).join("\n");
-  return JSON.stringify([
-    {
-      id: 1739,
-      modified_gmt: options.modifiedGmt ?? "2026-09-08T12:57:59",
-      content: { rendered: `<p>Orar</p>${anchors}` },
-    },
-  ]);
-}
-
-interface FetchScript {
-  page?: (request: Request) => Response | Promise<Response>;
-  pdf?: (url: string, request: Request) => Response | Promise<Response>;
-}
-
-const restorers: (() => void)[] = [];
-
-function installFetch(script: FetchScript): void {
-  const original = globalThis.fetch;
-  restorers.push(() => {
-    globalThis.fetch = original;
-  });
-
-  globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    const request = new Request(url, init as RequestInit);
-    if (url.startsWith("https://fcim.utm.md/wp-json/")) {
-      return script.page
-        ? script.page(request)
-        : new Response(pagePayload(), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    if (url.endsWith(".pdf")) {
-      return script.pdf
-        ? script.pdf(url, request)
-        : new Response(PDF_BODY, {
-            status: 200,
-            headers: {
-              "Content-Type": "application/pdf",
-              "Content-Length": String(PDF_BODY.byteLength),
-              ETag: '"pdf-1"',
-            },
-          });
-    }
-    throw new Error(`unexpected fetch in test: ${url}`);
+/** After Gate F no broker code path may reach the Internet; a call here is a test failure. */
+const originalFetch = globalThis.fetch;
+beforeEach(() => {
+  globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+    throw new Error(`the broker must make no outbound request: ${String(input)}`);
   }) as typeof fetch;
-}
-
+});
 afterEach(() => {
-  while (restorers.length) restorers.pop()!();
+  globalThis.fetch = originalFetch;
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -91,43 +49,38 @@ function harness(): WorkerHarness {
   return createHarness({ FCIM_PAGE_API_URL: PAGE_API_URL });
 }
 
-async function ingestJobsFor(h: WorkerHarness): Promise<IngestPdfJob[]> {
-  return h.queue.sent.filter((job): job is IngestPdfJob => job.kind === "ingest_pdf");
+async function open(h: WorkerHarness, page = pagePayload()): Promise<PlanResponse> {
+  const response = await openPublication(h, page);
+  expect(response.status).toBe(201);
+  return (await response.json()) as PlanResponse;
 }
 
-async function publishFully(h: WorkerHarness): Promise<string> {
-  const discovery = await runDiscovery(h.env, { force: true });
-  expect(discovery.outcome).toBe("scheduled");
-  await drainQueue(h, worker.queue);
-  return discovery.snapshot_id!;
+async function uploadAll(h: WorkerHarness, plan: PlanResponse, body = PDF_BODY): Promise<void> {
+  for (const file of plan.files) {
+    const response = await uploadPublicationFile(h, plan.snapshot_id, file.file_id, body);
+    expect(response.status).toBe(200);
+  }
 }
 
-describe("split publication: discovery", () => {
+describe("staged publication: opening a publication", () => {
   it("mirrors every strictly-valid official PDF, including names it cannot interpret", async () => {
     // NR-A: the deleted `anul_(i|ii)` filename filter would have starved discoverPdf() of these.
-    installFetch({
-      page: async () =>
-        new Response(
-          pagePayload({
-            filenames: [
-              "orar-licenta-anul-1.pdf",
-              "orar-licenta-anul-2.pdf",
-              "orar-master-2026-sem-3-anul-2-1.pdf",
-              "orar_ses_toamna_fr-3.pdf",
-            ],
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
-    });
-
     const h = harness();
-    const result = await runDiscovery(h.env);
+    const plan = await open(
+      h,
+      pagePayload({
+        filenames: [
+          "orar-licenta-anul-1.pdf",
+          "orar-licenta-anul-2.pdf",
+          "orar-master-2026-sem-3-anul-2-1.pdf",
+          "orar_ses_toamna_fr-3.pdf",
+        ],
+      }),
+    );
 
-    expect(result.outcome).toBe("scheduled");
-    expect(result.files).toBe(4);
-
-    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(result.snapshot_id!))!;
-    expect(descriptor.files.map((f) => f.filename).sort()).toEqual([
+    expect(plan.files).toHaveLength(4);
+    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(plan.snapshot_id))!;
+    expect(descriptor.files.map((file) => file.filename).sort()).toEqual([
       "orar-licenta-anul-1.pdf",
       "orar-licenta-anul-2.pdf",
       "orar-master-2026-sem-3-anul-2-1.pdf",
@@ -136,32 +89,26 @@ describe("split publication: discovery", () => {
   });
 
   it("gives two upload folders that share a basename their own object names", async () => {
-    installFetch({
-      page: async () =>
-        new Response(
-          JSON.stringify([
-            {
-              id: 1739,
-              modified_gmt: "2026-09-08T12:57:59",
-              content: {
-                rendered: `
-                  <a href="https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/orar.pdf">new</a>
-                  <a href="https://fcim.utm.md/wp-content/uploads/sites/24/2026/08/orar.pdf">old</a>`,
-              },
-            },
-          ]),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
-    });
-
     const h = harness();
-    const discovery = await runDiscovery(h.env);
-    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(discovery.snapshot_id!))!;
+    const page = JSON.stringify([
+      {
+        id: 1739,
+        modified_gmt: "2026-09-08T12:57:59",
+        content: {
+          rendered: `
+            <a href="https://fcim.utm.md/wp-content/uploads/sites/24/2026/09/orar.pdf">new</a>
+            <a href="https://fcim.utm.md/wp-content/uploads/sites/24/2026/08/orar.pdf">old</a>`,
+        },
+      },
+    ]);
 
-    expect(new Set(descriptor.files.map((f) => f.r2_key)).size).toBe(2);
-    expect(descriptor.files.map((f) => f.filename).sort()).toEqual(["2026-08-orar.pdf", "orar.pdf"]);
+    const plan = await open(h, page);
+    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(plan.snapshot_id))!;
+    expect(new Set(descriptor.files.map((file) => file.r2_key)).size).toBe(2);
+    expect(descriptor.files.map((file) => file.filename).sort()).toEqual(["2026-08-orar.pdf", "orar.pdf"]);
 
-    await drainQueue(h, worker.queue);
+    await uploadAll(h, plan);
+    expect((await completePublication(h, plan.snapshot_id)).status).toBe(200);
     for (const file of descriptor.files) {
       expect(h.bucket.has(file.r2_key)).toBe(true);
     }
@@ -169,533 +116,170 @@ describe("split publication: discovery", () => {
     expect(pointer.ok && pointer.pointer.pdf_count).toBe(2);
   });
 
-  it("writes only the page payload and the descriptor, and never touches current.json", async () => {
-    installFetch({});
+  it("writes only the page payload, the descriptor and the operation record", async () => {
     const h = harness();
+    const plan = await open(h);
 
-    const result = await runDiscovery(h.env);
-    const snapshotId = result.snapshot_id!;
-
-    expect(h.bucket.has(snapshotPageApiKey(snapshotId))).toBe(true);
-    expect(h.bucket.has(pendingDescriptorKey(snapshotId))).toBe(true);
-    expect(h.bucket.has(snapshotManifestKey(snapshotId))).toBe(false);
+    expect(h.bucket.has(snapshotPageApiKey(plan.snapshot_id))).toBe(true);
+    expect(h.bucket.has(pendingDescriptorKey(plan.snapshot_id))).toBe(true);
+    expect(h.bucket.has(snapshotManifestKey(plan.snapshot_id))).toBe(false);
     expect(h.bucket.has("current.json")).toBe(false);
-
-    // One bounded job per PDF, plus one backstop finalize.
-    const kinds = h.queue.sent.map((job) => job.kind);
-    expect(kinds.filter((k) => k === "ingest_pdf")).toHaveLength(2);
-    expect(kinds.filter((k) => k === "finalize")).toHaveLength(1);
+    // Opening a publication schedules no background work at all.
+    expect(h.queue.sent).toEqual([]);
   });
 
-  it("reports unchanged when modified_gmt, the PDF catalogue and every PDF are unchanged", async () => {
-    installFetch({});
+  it("chains a new publication onto the snapshot that is current when it opens", async () => {
     const h = harness();
-    await publishFully(h);
+    const first = await publishThroughApi(h);
 
-    installFetch({
-      pdf: async (_url, request) =>
-        request.headers.get("If-None-Match") === '"pdf-1"'
-          ? new Response(null, { status: 304 })
-          : new Response(PDF_BODY, { status: 200 }),
-    });
-
-    const second = await runDiscovery(h.env);
-    expect(second.outcome).toBe("unchanged");
-    expect(h.queue.ofKind("ingest_pdf")).toHaveLength(2); // nothing new scheduled
-  });
-
-  it("uses the immutable manifest to revalidate an exact legacy current pointer", async () => {
-    installFetch({
-      page: async () =>
-        new Response(pagePayload(), {
-          status: 200,
-          headers: { "Content-Type": "application/json", ETag: '"page-legacy"' },
-        }),
-    });
-    const h = harness();
-    const snapshotId = await publishFully(h);
-    const current = h.bucket.json<{ updated_at: string; manifest_r2_key: string }>("current.json")!;
-    h.bucket.seed(
-      "current.json",
-      JSON.stringify({
-        schema_version: 1,
-        snapshot_id: snapshotId,
-        updated_at: current.updated_at,
-        manifest_r2_key: current.manifest_r2_key,
+    const plan = await open(
+      h,
+      pagePayload({
+        filenames: ["anul_i_semestrul_i-19.pdf", "anul_ii_semestrul_iii-13.pdf", "anul_iii_semestrul_v-5.pdf"],
       }),
     );
+    expect(plan.snapshot_id).not.toBe(first.snapshotId);
+    expect(plan.files).toHaveLength(3);
 
-    let pageRevalidated = false;
-    let pdfsRevalidated = 0;
-    installFetch({
-      page: async (request) => {
-        pageRevalidated = request.headers.get("If-None-Match") === '"page-legacy"';
-        return new Response(null, { status: 304 });
-      },
-      pdf: async (_url, request) => {
-        if (request.headers.get("If-None-Match") === '"pdf-1"') pdfsRevalidated += 1;
-        return new Response(null, { status: 304 });
-      },
-    });
-
-    const result = await runDiscovery(h.env);
-    expect(result).toMatchObject({ outcome: "unchanged", previous_snapshot_id: snapshotId });
-    expect(pageRevalidated).toBe(true);
-    expect(pdfsRevalidated).toBe(2);
-  });
-
-  it("publishes again when the page catalogue gains a PDF", async () => {
-    installFetch({});
-    const h = harness();
-    const first = await publishFully(h);
-
-    installFetch({
-      page: async () =>
-        new Response(
-          pagePayload({
-            filenames: ["anul_i_semestrul_i-19.pdf", "anul_ii_semestrul_iii-13.pdf", "anul_iii_semestrul_v-5.pdf"],
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
-    });
-
-    const second = await runDiscovery(h.env);
-    expect(second.outcome).toBe("scheduled");
-    expect(second.snapshot_id).not.toBe(first);
-    expect(second.files).toBe(3);
-    expect(second.previous_snapshot_id).toBe(first);
+    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(plan.snapshot_id))!;
+    expect(descriptor.previous_snapshot_id).toBe(first.snapshotId);
   });
 });
 
-describe("split publication: error matrix", () => {
-  const cases: { name: string; page: () => Response; expectError: RegExp }[] = [
-    {
-      name: "403 challenge",
-      page: () => new Response("denied", { status: 403 }),
-      expectError: /HTTP 403/,
-    },
-    {
-      name: "500 upstream failure",
-      page: () => new Response("boom", { status: 500 }),
-      expectError: /HTTP 500/,
-    },
-    {
-      name: "redirect",
-      page: () => new Response(null, { status: 302, headers: { Location: "https://evil.example/page" } }),
-      expectError: /redirect/i,
-    },
-  ];
-
-  for (const testCase of cases) {
-    it(`treats a Page API ${testCase.name} as an error, never as unchanged`, async () => {
-      installFetch({ page: async () => testCase.page() });
-      const h = harness();
-
-      const result = await runDiscovery(h.env);
-      expect(result.outcome).toBe("error");
-      expect(result.error).toMatch(testCase.expectError);
-      expect(h.bucket.has("current.json")).toBe(false);
-    });
-  }
-
-  it("treats a Page API network failure as an error", async () => {
-    installFetch({
-      page: async () => {
-        throw new Error("connection reset");
-      },
-    });
-    const h = harness();
-
-    const result = await runDiscovery(h.env);
-    expect(result.outcome).toBe("error");
-    expect(result.error).toMatch(/connection reset/);
-  });
-
-  it("leaves the previous current pointer untouched when discovery fails", async () => {
-    installFetch({});
-    const h = harness();
-    const published = await publishFully(h);
-
-    installFetch({ page: async () => new Response("denied", { status: 403 }) });
-    const failed = await runDiscovery(h.env);
-
-    expect(failed.outcome).toBe("error");
-    const pointer = parseCurrentPointer(h.bucket.text("current.json")!);
-    expect(pointer.ok && pointer.pointer.snapshot_id).toBe(published);
-  });
-
-  it("keeps authenticated HTTP producer-only and leaves discovery retry to the queue", async () => {
-    const upstream = vi.fn();
-    const original = globalThis.fetch;
-    restorers.push(() => {
-      globalThis.fetch = original;
-    });
-    globalThis.fetch = upstream as typeof fetch;
-    const h = harness();
-    const response = await worker.fetch(
-      new Request("https://broker.local/publish", {
-        method: "POST",
-        headers: { Authorization: "Bearer test-secret" },
-      }),
-      h.env,
-      h.ctx,
-    );
-
-    expect(response.status).toBe(202);
-    expect(await response.json()).toMatchObject({ outcome: "queued", stage: "discover" });
-    expect(h.queue.pending).toContainEqual(expect.objectContaining({
-      body: expect.objectContaining({ kind: "discover", force: false }),
-    }));
-    expect(upstream).not.toHaveBeenCalled();
-  });
-
-  it("keeps the scheduled handler producer-only and queues discovery plus reconciliation", async () => {
-    const upstream = vi.fn();
-    const original = globalThis.fetch;
-    restorers.push(() => {
-      globalThis.fetch = original;
-    });
-    globalThis.fetch = upstream as typeof fetch;
-    const h = harness();
-
-    await worker.scheduled(
-      { cron: "*/20 * * * *", type: "scheduled", scheduledTime: Date.now() },
-      h.env,
-      h.ctx,
-    );
-
-    expect(h.queue.ofKind("discover")).toHaveLength(1);
-    expect(h.queue.ofKind("reconcile")).toHaveLength(1);
-    expect(upstream).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ["network", null],
-    ["403", 403],
-    ["429", 429],
-    ["5xx", 503],
-  ] as const)("retries a queued discovery %s failure with an explicit five-minute delay", async (_name, status) => {
-    installFetch({
-      page: async () => {
-        if (status === null) throw new Error("connection reset");
-        return new Response("upstream failure", { status });
-      },
-    });
-    const h = harness();
-    const retry = vi.fn();
-    const ack = vi.fn();
-    const batch: QueueMessageBatch<PublicationJob> = {
-      queue: "fcim-broker-publication",
-      messages: [{
-        id: "discover-transient",
-        timestamp: new Date(),
-        body: buildDiscoverJob(),
-        attempts: 1,
-        ack,
-        retry,
-      }],
-      ackAll: vi.fn(),
-      retryAll: vi.fn(),
-    };
-
-    await worker.queue(batch, h.env, h.ctx);
-    expect(retry).toHaveBeenCalledWith({ delaySeconds: 300 });
-    expect(ack).not.toHaveBeenCalled();
-  });
-
-  it("acks a deterministic queued discovery error instead of retrying it", async () => {
-    const h = createHarness({ FCIM_PAGE_API_URL: "https://example.com/not-approved" });
-    const retry = vi.fn();
-    const ack = vi.fn();
-    await worker.queue({
-      queue: "fcim-broker-publication",
-      messages: [{ id: "discover-invalid", timestamp: new Date(), body: buildDiscoverJob(), attempts: 1, ack, retry }],
-      ackAll: vi.fn(),
-      retryAll: vi.fn(),
-    }, h.env, h.ctx);
-
-    expect(ack).toHaveBeenCalledOnce();
-    expect(retry).not.toHaveBeenCalled();
-  });
-
-  it("retries a queued discovery until the upstream recovers", async () => {
-    let attempts = 0;
-    installFetch({
-      page: async () => {
-        attempts += 1;
-        return attempts <= 2
-          ? new Response("denied", { status: 403 })
-          : new Response(pagePayload(), { status: 200, headers: { "Content-Type": "application/json" } });
-      },
-    });
-
-    const h = harness();
-    await worker.scheduled(
-      { cron: "*/20 * * * *", type: "scheduled", scheduledTime: Date.now() },
-      h.env,
-      h.ctx,
-    );
-
-    const drain = await drainQueue(h, worker.queue);
-    expect(drain.deadLettered).toBe(0);
-
-    const pointer = parseCurrentPointer(h.bucket.text("current.json")!);
-    expect(pointer.ok).toBe(true);
-  });
-
-  it("dead-letters a queued discovery that never recovers", async () => {
-    installFetch({ page: async () => new Response("denied", { status: 403 }) });
-    const h = harness();
-
-    await worker.scheduled(
-      { cron: "*/20 * * * *", type: "scheduled", scheduledTime: Date.now() },
-      h.env,
-      h.ctx,
-    );
-
-    const drain = await drainQueue(h, worker.queue);
-    expect(drain.deadLettered).toBe(1);
-    expect(h.bucket.has("current.json")).toBe(false);
-  });
-
-  it("recovers on the next scheduled cycle after a discovery job is dead-lettered", async () => {
-    let healthy = false;
-    installFetch({
-      page: async () =>
-        healthy
-          ? new Response(pagePayload(), { status: 200, headers: { "Content-Type": "application/json" } })
-          : new Response("denied", { status: 403 }),
-    });
-    const h = harness();
-
-    // First cron tick: FCIM is down for the whole retry budget, so the message is dead-lettered
-    // and current.json is left exactly as it was (absent, here).
-    await worker.scheduled(
-      { cron: "*/20 * * * *", type: "scheduled", scheduledTime: Date.now() },
-      h.env,
-      h.ctx,
-    );
-    const firstDrain = await drainQueue(h, worker.queue);
-    expect(firstDrain.deadLettered).toBe(1);
-    expect(h.bucket.has("current.json")).toBe(false);
-
-    // FCIM recovers before the next normal cron tick fires — no manual/administrative action.
-    healthy = true;
-    await worker.scheduled(
-      { cron: "*/20 * * * *", type: "scheduled", scheduledTime: Date.now() },
-      h.env,
-      h.ctx,
-    );
-    const secondDrain = await drainQueue(h, worker.queue);
-    expect(secondDrain.deadLettered).toBe(0);
-
-    const pointer = parseCurrentPointer(h.bucket.text("current.json")!);
-    expect(pointer.ok).toBe(true);
-  });
-});
-
-describe("split publication: PDF ingest jobs", () => {
+describe("staged publication: uploads", () => {
   it("stores each PDF under its own create-only key and records a completion marker", async () => {
-    installFetch({});
     const h = harness();
-    const discovery = await runDiscovery(h.env);
-    const jobs = await ingestJobsFor(h);
+    const plan = await open(h);
 
-    const result = await runPdfIngest(h.env, jobs[0]);
-    expect(result.outcome).toBe("ingested");
-    expect(h.bucket.has(jobs[0].r2_key)).toBe(true);
+    const response = await uploadPublicationFile(h, plan.snapshot_id, "f0", PDF_BODY);
+    expect(response.status).toBe(200);
 
-    const marker = h.bucket.json<CompletionMarker>(
-      pendingCompletionKey(discovery.snapshot_id!, jobs[0].file_id),
-    )!;
-    expect(marker.source_url).toBe(jobs[0].source_url);
-    expect(marker.r2_key).toBe(jobs[0].r2_key);
+    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(plan.snapshot_id))!;
+    const entry = descriptor.files[0];
+    expect(h.bucket.has(entry.r2_key)).toBe(true);
+
+    const marker = h.bucket.json<CompletionMarker>(pendingCompletionKey(plan.snapshot_id, "f0"))!;
+    expect(marker.source_url).toBe(entry.source_url);
+    expect(marker.r2_key).toBe(entry.r2_key);
     expect(marker.size).toBe(PDF_BODY.byteLength);
   });
 
-  it("is idempotent when the same job is delivered twice", async () => {
-    installFetch({});
+  it("is idempotent when the same upload is delivered twice", async () => {
     const h = harness();
-    await runDiscovery(h.env);
-    const jobs = await ingestJobsFor(h);
+    const plan = await open(h);
 
-    const first = await runPdfIngest(h.env, jobs[0]);
-    const second = await runPdfIngest(h.env, jobs[0]);
+    const first = await uploadPublicationFile(h, plan.snapshot_id, "f0", PDF_BODY);
+    const second = await uploadPublicationFile(h, plan.snapshot_id, "f0", PDF_BODY);
+    expect((await first.json()).status).toBe("stored");
+    expect((await second.json()).status).toBe("already_stored");
 
-    expect(first.outcome).toBe("ingested");
-    expect(second.outcome).toBe("already_ingested");
-    expect(h.bucket.bytes(jobs[0].r2_key)).toEqual(PDF_BODY);
+    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(plan.snapshot_id))!;
+    expect(h.bucket.bytes(descriptor.files[0].r2_key)).toEqual(PDF_BODY);
   });
 
   it("fails rather than overwriting when the key exists with different provenance", async () => {
-    installFetch({});
     const h = harness();
-    await runDiscovery(h.env);
-    const jobs = await ingestJobsFor(h);
+    const plan = await open(h);
+    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(plan.snapshot_id))!;
 
-    h.bucket.seed(jobs[0].r2_key, "someone else's bytes", {
+    h.bucket.seed(descriptor.files[0].r2_key, "someone else's bytes", {
       source_url: `${UPLOAD_BASE}/unrelated.pdf`,
+      content_sha256: "f".repeat(64),
     });
 
-    const result = await runPdfIngest(h.env, jobs[0]);
-    expect(result.outcome).toBe("conflict");
-    expect(h.bucket.text(jobs[0].r2_key)).toBe("someone else's bytes");
+    const response = await uploadPublicationFile(h, plan.snapshot_id, "f0", PDF_BODY);
+    expect(response.status).toBe(409);
+    expect(h.bucket.text(descriptor.files[0].r2_key)).toBe("someone else's bytes");
   });
 
-  it("refuses a job that does not match the pending descriptor", async () => {
-    installFetch({});
+  it("refuses an upload the descriptor does not describe", async () => {
     const h = harness();
-    const discovery = await runDiscovery(h.env);
+    const plan = await open(h);
 
-    const forged = buildIngestJob({
-      snapshotId: discovery.snapshot_id!,
-      fileId: "f0",
-      filename: "not-in-descriptor.pdf",
-      sourceUrl: `${UPLOAD_BASE}/not-in-descriptor.pdf`,
-    });
-
-    const result = await runPdfIngest(h.env, forged);
-    expect(result.outcome).toBe("error");
-    expect(result.error).toMatch(/does not match the pending descriptor/);
-    expect(h.bucket.has(forged.r2_key)).toBe(false);
-  });
-
-  it("retries a transient PDF failure and eventually publishes", async () => {
-    let failures = 0;
-    installFetch({
-      pdf: async (url) => {
-        if (url.endsWith("anul_ii_semestrul_iii-13.pdf") && failures < 2) {
-          failures += 1;
-          return new Response("upstream hiccup", { status: 503 });
-        }
-        return new Response(PDF_BODY, { status: 200, headers: { "Content-Type": "application/pdf" } });
-      },
-    });
-
-    const h = harness();
-    const discovery = await runDiscovery(h.env);
-    const drain = await drainQueue(h, worker.queue);
-
-    expect(failures).toBe(2);
-    expect(drain.retried).toBe(2);
-    expect(drain.deadLettered).toBe(0);
-
-    const pointer = parseCurrentPointer(h.bucket.text("current.json")!);
-    expect(pointer.ok && pointer.pointer.snapshot_id).toBe(discovery.snapshot_id);
-  });
-
-  it("never publishes a snapshot whose PDF permanently fails", async () => {
-    installFetch({
-      pdf: async (url) =>
-        url.endsWith("anul_ii_semestrul_iii-13.pdf")
-          ? new Response("gone", { status: 404 })
-          : new Response(PDF_BODY, { status: 200 }),
-    });
-
-    const h = harness();
-    await runDiscovery(h.env);
-    const drain = await drainQueue(h, worker.queue);
-
-    expect(drain.deadLettered).toBe(0);
-    expect(drain.retried).toBe(0);
-    expect(h.bucket.has("current.json")).toBe(false);
+    // There is no way to name a file the plan does not contain: the id is the only client input,
+    // and everything used to address storage is looked up from the broker's own descriptor.
+    const response = await uploadPublicationFile(h, plan.snapshot_id, "f9", PDF_BODY);
+    expect(response.status).toBe(404);
+    expect(h.bucket.keys().some((key) => key.includes("/pdfs/"))).toBe(false);
   });
 });
 
-describe("split publication: finalize", () => {
-  it("refuses to publish before every ingest job has completed", async () => {
-    installFetch({});
+describe("staged publication: completion", () => {
+  it("refuses to publish before every planned upload has arrived", async () => {
     const h = harness();
-    const discovery = await runDiscovery(h.env);
-    const snapshotId = discovery.snapshot_id!;
-    const jobs = await ingestJobsFor(h);
+    const plan = await open(h);
+    await uploadPublicationFile(h, plan.snapshot_id, "f0", PDF_BODY);
 
-    await runPdfIngest(h.env, jobs[0]);
-
-    const early = await runFinalize(h.env, snapshotId);
+    const early = await runFinalize(h.env, plan.snapshot_id);
     expect(early.outcome).toBe("incomplete");
-    expect(early.missing).toContain(jobs[1].r2_key);
-    expect(h.bucket.has(snapshotManifestKey(snapshotId))).toBe(false);
+    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(plan.snapshot_id))!;
+    expect(early.missing).toContain(descriptor.files[1].r2_key);
+    expect(h.bucket.has(snapshotManifestKey(plan.snapshot_id))).toBe(false);
     expect(h.bucket.has("current.json")).toBe(false);
   });
 
   it("publishes once every expected object and marker exists, and the manifest agrees with the descriptor", async () => {
-    installFetch({});
     const h = harness();
-    const discovery = await runDiscovery(h.env);
-    const snapshotId = discovery.snapshot_id!;
-    const jobs = await ingestJobsFor(h);
+    const plan = await open(h);
+    await uploadAll(h, plan);
 
-    for (const job of jobs) await runPdfIngest(h.env, job);
+    expect((await completePublication(h, plan.snapshot_id)).status).toBe(200);
 
-    const finalized = await runFinalize(h.env, snapshotId);
-    expect(finalized.outcome).toBe("published");
+    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(plan.snapshot_id))!;
+    const manifest = h.bucket.json<SnapshotManifest>(snapshotManifestKey(plan.snapshot_id))!;
 
-    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(snapshotId))!;
-    const manifest = h.bucket.json<SnapshotManifest>(snapshotManifestKey(snapshotId))!;
-
-    expect(manifest.snapshot_id).toBe(snapshotId);
-    expect(manifest.files.map((f) => f.r2_key).sort()).toEqual(descriptor.files.map((f) => f.r2_key).sort());
+    expect(manifest.snapshot_id).toBe(plan.snapshot_id);
+    expect(manifest.files.map((file) => file.r2_key).sort()).toEqual(
+      descriptor.files.map((file) => file.r2_key).sort(),
+    );
     expect(manifest.source).toEqual(descriptor.source);
 
     const pointer = parseCurrentPointer(h.bucket.text("current.json")!);
     expect(pointer.ok).toBe(true);
     if (pointer.ok) {
-      expect(pointer.pointer.snapshot_id).toBe(snapshotId);
-      expect(pointer.pointer.manifest_r2_key).toBe(snapshotManifestKey(snapshotId));
+      expect(pointer.pointer.snapshot_id).toBe(plan.snapshot_id);
+      expect(pointer.pointer.manifest_r2_key).toBe(snapshotManifestKey(plan.snapshot_id));
       expect(pointer.pointer.pdf_count).toBe(2);
       expect(pointer.pointer.page_modified_gmt).toBe("2026-09-08T12:57:59");
     }
   });
 
   it("is safe to run twice", async () => {
-    installFetch({});
     const h = harness();
-    const snapshotId = await publishFully(h);
-
-    const again = await runFinalize(h.env, snapshotId);
-    expect(again.outcome).toBe("already_current");
+    const result = await publishThroughApi(h);
+    expect((await runFinalize(h.env, result.snapshotId)).outcome).toBe("already_current");
   });
 
-  it("loses the CAS when a newer publisher already advanced current.json", async () => {
-    installFetch({});
+  it("loses the CAS when a newer publication already advanced current.json", async () => {
     const h = harness();
-    const first = await publishFully(h);
+    const first = await publishThroughApi(h);
 
-    // A second cycle reads the pointer written by the first...
-    const second = await runDiscovery(h.env, { force: true });
-    const secondId = second.snapshot_id!;
-    const jobs = h.queue.sent
-      .filter((job): job is IngestPdfJob => job.kind === "ingest_pdf" && job.snapshot_id === secondId);
-    for (const job of jobs) await runPdfIngest(h.env, job);
+    // A second publication reads the pointer written by the first...
+    const plan = await open(h, pagePayload({ modifiedGmt: "2026-09-09T09:00:00" }));
+    await uploadAll(h, plan, pdfBody("second"));
 
-    // ...but a third publisher advances current.json before the second one finalizes.
+    // ...but something advances current.json before it completes.
     const stolen = JSON.parse(h.bucket.text("current.json")!) as Record<string, unknown>;
-    h.bucket.seed("current.json", JSON.stringify({ ...stolen, snapshot_id: first }));
+    h.bucket.seed("current.json", JSON.stringify({ ...stolen, updated_at: "2026-09-09T09:30:00.000Z" }));
 
-    const finalized = await runFinalize(h.env, secondId);
-    expect(finalized.outcome).toBe("superseded");
+    expect((await runFinalize(h.env, plan.snapshot_id)).outcome).toBe("superseded");
 
     const pointer = parseCurrentPointer(h.bucket.text("current.json")!);
-    expect(pointer.ok && pointer.pointer.snapshot_id).toBe(first);
+    expect(pointer.ok && pointer.pointer.snapshot_id).toBe(first.snapshotId);
     // The superseded snapshot survives intact as harmless history.
-    expect(h.bucket.has(snapshotManifestKey(secondId))).toBe(true);
+    expect(h.bucket.has(snapshotManifestKey(plan.snapshot_id))).toBe(true);
   });
 
   it("errors when a completion marker disagrees with the descriptor", async () => {
-    installFetch({});
     const h = harness();
-    const discovery = await runDiscovery(h.env);
-    const snapshotId = discovery.snapshot_id!;
-    const jobs = await ingestJobsFor(h);
-    for (const job of jobs) await runPdfIngest(h.env, job);
+    const plan = await open(h);
+    await uploadAll(h, plan);
 
-    const markerKey = pendingCompletionKey(snapshotId, jobs[0].file_id);
+    const markerKey = pendingCompletionKey(plan.snapshot_id, "f0");
     const marker = h.bucket.json<CompletionMarker>(markerKey)!;
     h.bucket.seed(markerKey, JSON.stringify({ ...marker, source_url: `${UPLOAD_BASE}/swapped.pdf` }));
 
-    const finalized = await runFinalize(h.env, snapshotId);
-    expect(finalized.outcome).toBe("error");
+    expect((await runFinalize(h.env, plan.snapshot_id)).outcome).toBe("error");
     expect(h.bucket.has("current.json")).toBe(false);
   });
 });
@@ -706,140 +290,99 @@ function agedSnapshotId(minutesAgo: number, suffix = "abcdef12"): string {
   return `${stamp}-${suffix}`;
 }
 
-describe("split publication: reconciliation", () => {
-  it("re-drives only the missing file in a partially completed stalled snapshot", async () => {
-    installFetch({});
+/** Copy a live publication's state onto a backdated snapshot id, as a stalled run would look. */
+function backdate(h: WorkerHarness, snapshotId: string, agedId: string): PendingDescriptor {
+  const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(snapshotId))!;
+  const aged: PendingDescriptor = {
+    ...descriptor,
+    snapshot_id: agedId,
+    files: descriptor.files.map((file) => ({ ...file, r2_key: file.r2_key.replace(snapshotId, agedId) })),
+  };
+  h.bucket.seed(pendingDescriptorKey(agedId), JSON.stringify(aged));
+  h.bucket.seed(snapshotPageApiKey(agedId), h.bucket.text(snapshotPageApiKey(snapshotId))!, {
+    snapshot_id: agedId,
+    operation_id: descriptor.operation_id,
+    page_api_sha256: descriptor.page_api_sha256,
+  });
+  return aged;
+}
+
+describe("staged publication: reconciliation", () => {
+  it("re-drives finalize for a stalled publication, and never asks anyone for bytes", async () => {
     const h = harness();
-    const discovery = await runDiscovery(h.env);
-    const snapshotId = discovery.snapshot_id!;
-    const jobs = await ingestJobsFor(h);
-    await runPdfIngest(h.env, jobs[0]);
+    const plan = await open(h);
+    await uploadAll(h, plan);
 
-    // Backdate the descriptor's prefix so reconciliation considers it stalled rather than fresh.
     const staleId = agedSnapshotId(30);
-    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(snapshotId))!;
-    const staleDescriptor: PendingDescriptor = {
-      ...descriptor,
-      snapshot_id: staleId,
-      files: descriptor.files.map((f) => ({ ...f, r2_key: f.r2_key.replace(snapshotId, staleId) })),
-    };
-    h.bucket.seed(pendingDescriptorKey(staleId), JSON.stringify(staleDescriptor));
-    h.bucket.seed(
-      snapshotPageApiKey(staleId),
-      h.bucket.text(snapshotPageApiKey(snapshotId))!,
-    );
-
-    // Preserve the first file's completion under the aged snapshot. Only the second file is
-    // missing, so reconciliation must not duplicate work for the already-completed file.
-    const completedMarker = h.bucket.json<CompletionMarker>(
-      pendingCompletionKey(snapshotId, jobs[0].file_id),
-    )!;
-    h.bucket.seed(
-      staleDescriptor.files[0].r2_key,
-      h.bucket.text(jobs[0].r2_key)!,
-      {
+    const aged = backdate(h, plan.snapshot_id, staleId);
+    const live = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(plan.snapshot_id))!;
+    for (const [index, file] of aged.files.entries()) {
+      const source = h.bucket.json<CompletionMarker>(pendingCompletionKey(plan.snapshot_id, file.file_id))!;
+      h.bucket.seed(file.r2_key, h.bucket.text(live.files[index].r2_key)!, {
         snapshot_id: staleId,
-        file_id: jobs[0].file_id,
-        source_url: jobs[0].source_url,
-      },
-    );
-    h.bucket.seed(
-      pendingCompletionKey(staleId, jobs[0].file_id),
-      JSON.stringify({
-        ...completedMarker,
-        snapshot_id: staleId,
-        r2_key: staleDescriptor.files[0].r2_key,
-      }),
-    );
+        file_id: file.file_id,
+        source_url: file.source_url,
+      });
+      h.bucket.seed(
+        pendingCompletionKey(staleId, file.file_id),
+        JSON.stringify({ ...source, snapshot_id: staleId, r2_key: file.r2_key }),
+      );
+    }
 
     const before = h.queue.sent.length;
     const result = await runReconcile(h.env);
 
     expect(result.outcome).toBe("requeued");
-    expect(result.requeued_ingests).toBe(1);
     expect(result.requeued_finalizes).toBe(1);
-
-    const requeued = h.queue.sent.slice(before) as PublicationJob[];
-    expect(requeued).toEqual([
-      expect.objectContaining({
-        kind: "ingest_pdf",
-        snapshot_id: staleId,
-        file_id: staleDescriptor.files[1].file_id,
-      }),
+    expect(h.queue.sent.slice(before)).toEqual([
       expect.objectContaining({ kind: "finalize", snapshot_id: staleId }),
     ]);
 
-    const missingJob = requeued.find((job): job is IngestPdfJob => job.kind === "ingest_pdf")!;
-    expect((await runPdfIngest(h.env, missingJob)).outcome).toBe("ingested");
-    expect((await runFinalize(h.env, staleId)).outcome).toBe("published");
+    await drainQueue(h, worker.queue);
     expect(h.bucket.has(snapshotManifestKey(staleId))).toBe(true);
   });
 
   it("ignores a snapshot that already has a manifest", async () => {
-    installFetch({});
     const h = harness();
-    const snapshotId = await publishFully(h);
+    const result = await publishThroughApi(h);
 
-    // Age the finished snapshot's pending prefix into the reconciliation window.
     const agedId = agedSnapshotId(30, "beef0001");
-    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(snapshotId))!;
-    h.bucket.seed(pendingDescriptorKey(agedId), JSON.stringify({ ...descriptor, snapshot_id: agedId }));
+    backdate(h, result.snapshotId, agedId);
     h.bucket.seed(snapshotManifestKey(agedId), JSON.stringify({ snapshot_id: agedId }));
 
-    const result = await runReconcile(h.env);
-    expect(result.requeued_ingests).toBe(0);
-    expect(result.requeued_finalizes).toBe(0);
+    expect((await runReconcile(h.env)).requeued_finalizes).toBe(0);
   });
 
-  it("does not re-fetch a pending snapshot whose observed current ETag is superseded", async () => {
-    installFetch({});
+  it("leaves alone a pending publication whose observed current ETag is superseded", async () => {
     const h = harness();
-    const discovery = await runDiscovery(h.env);
-    const snapshotId = discovery.snapshot_id!;
-    const descriptor = h.bucket.json<PendingDescriptor>(pendingDescriptorKey(snapshotId))!;
-    const agedId = agedSnapshotId(30, "dead0002");
-    h.bucket.seed(
-      pendingDescriptorKey(agedId),
-      JSON.stringify({
-        ...descriptor,
-        snapshot_id: agedId,
-        files: descriptor.files.map((file) => ({
-          ...file,
-          r2_key: file.r2_key.replace(snapshotId, agedId),
-        })),
-      }),
-    );
+    const plan = await open(h);
+    backdate(h, plan.snapshot_id, agedSnapshotId(30, "dead0002"));
     h.bucket.seed("current.json", JSON.stringify({ superseding: true }));
 
     const before = h.queue.sent.length;
     const result = await runReconcile(h.env);
 
     expect(result.outcome).toBe("idle");
-    expect(result.requeued_ingests).toBe(0);
     expect(result.requeued_finalizes).toBe(0);
     expect(h.queue.sent).toHaveLength(before);
   });
 });
 
-describe("split publication: end to end through the queue consumer", () => {
-  it("takes one trigger to a complete, current snapshot", async () => {
-    installFetch({});
+describe("staged publication: end to end", () => {
+  it("takes one publisher run to a complete, current snapshot", async () => {
     const h = harness();
+    const result = await publishThroughApi(h);
 
-    const discovery = await runDiscovery(h.env);
-    const snapshotId = discovery.snapshot_id!;
-    const drain = await drainQueue(h, worker.queue);
+    expect(result.completeBody.status).toBe("published");
+    expect(h.bucket.has(snapshotPageApiKey(result.snapshotId))).toBe(true);
+    expect(h.bucket.has(snapshotManifestKey(result.snapshotId))).toBe(true);
 
-    expect(drain.deadLettered).toBe(0);
-    expect(h.bucket.has(snapshotPageApiKey(snapshotId))).toBe(true);
-    expect(h.bucket.has(snapshotManifestKey(snapshotId))).toBe(true);
-
-    const manifest = h.bucket.json<SnapshotManifest>(snapshotManifestKey(snapshotId))!;
+    const manifest = h.bucket.json<SnapshotManifest>(snapshotManifestKey(result.snapshotId))!;
     for (const file of manifest.files) {
       expect(h.bucket.has(file.r2_key)).toBe(true);
     }
 
     const pointer = parseCurrentPointer(h.bucket.text("current.json")!);
-    expect(pointer.ok && pointer.pointer.snapshot_id).toBe(snapshotId);
+    expect(pointer.ok && pointer.pointer.snapshot_id).toBe(result.snapshotId);
   });
 });

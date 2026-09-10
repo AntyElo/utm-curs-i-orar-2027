@@ -1,4 +1,4 @@
-import { CURRENT_KEY, PENDING_PREFIX, SNAPSHOT_PREFIX, snapshotManifestKey } from "./keys";
+import { CURRENT_KEY, OPERATION_PREFIX, PENDING_PREFIX, SNAPSHOT_PREFIX, snapshotManifestKey } from "./keys";
 import { parseCurrentPointer, SNAPSHOT_ID_REGEX } from "./pointer";
 import type { Env, R2Bucket } from "./types";
 
@@ -8,6 +8,8 @@ export const SNAPSHOT_KEEP_PREDECESSORS = 2;
 export const GC_PREFIXES_PER_NAMESPACE = 8;
 export const GC_MAX_PREFIX_DELETIONS = 4;
 export const GC_MAX_OBJECTS_PER_PREFIX = 64;
+/** Operation records are one flat object each, so they are swept by object, not by prefix. */
+export const GC_MAX_OPERATION_DELETIONS = 64;
 export const RECONCILE_SCAN_PAGES = 3;
 export const RECONCILE_PAGE_SIZE = 100;
 
@@ -105,5 +107,38 @@ export async function runRetention(env: Env): Promise<{ deleted_objects: number 
     }
     await writeScanCursor(bucket, name, listing.truncated ? listing.cursor : undefined);
   }
+  deletedObjects += await sweepOperations(bucket, now);
   return { deleted_objects: deletedObjects };
+}
+
+/**
+ * Expire the create-only attempt→snapshot records under `operations/`.
+ *
+ * These are the one namespace with no prefix structure and no timestamp in the key, so they are
+ * aged by the object's own upload time and swept one bounded page per invocation, with a cursor
+ * of their own. Nothing about pending or snapshot retention changes.
+ *
+ * Deleting one is safe well before this threshold: a publication may only live for six hours, so
+ * a record older than the 24-hour retention age can no longer be resumed, and its id — a random
+ * UUIDv4 the client generated once — will never be presented again. Keeping them forever would
+ * make `operations/` the one namespace that grows without bound.
+ */
+async function sweepOperations(bucket: R2Bucket, now: number): Promise<number> {
+  const cursor = await readScanCursor(bucket, "gc-operations");
+  const listing = await bucket.list({
+    prefix: OPERATION_PREFIX,
+    limit: GC_MAX_OPERATION_DELETIONS,
+    cursor,
+  });
+  if (listing.truncated && !listing.cursor) throw new Error("R2 gc-operations listing truncated without cursor");
+
+  const expired = listing.objects
+    .filter((object) => now - object.uploaded.getTime() > RETENTION_AGE_MS)
+    .map((object) => object.key);
+  // One bulk delete, so a sweep of this namespace stays a single bounded operation.
+  if (expired.length > 0) await bucket.delete(expired);
+
+  // Persist the cursor last: a crash re-scans this page rather than skipping the next one.
+  await writeScanCursor(bucket, "gc-operations", listing.truncated ? listing.cursor : undefined);
+  return expired.length;
 }

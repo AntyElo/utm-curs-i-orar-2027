@@ -1,17 +1,22 @@
 /**
- * Split candidate-snapshot publication.
+ * Candidate-snapshot publication.
  *
- * One Worker invocation is not allowed to fetch every upstream PDF and close the snapshot: on the
- * Free plan that reliably costs more than the 10 ms CPU budget. Publication is therefore four
- * bounded stages, each in its own invocation, connected by a Cloudflare Queue:
+ * Gate F moved acquisition out of the broker entirely. The Moldova laptop (the "MD Publisher")
+ * is the only thing that talks to FCIM; it hands the broker raw Page API bytes and raw PDF bytes
+ * over an authenticated transport credential, and nothing else. The broker still decides
+ * everything that matters:
  *
- *   TRIGGER -> DISCOVERY -> PDF INGEST JOBS -> FINALIZE -> current.json CAS
+ *   PUBLISHER BYTES -> OPEN (broker derives the plan) -> UPLOADS -> COMPLETE -> current.json CAS
  *
- * The ordering guarantees are unchanged from the monolithic publisher and are what make a
+ * The publisher cannot choose a snapshot id, an R2 key, a filename, a PDF source URL, the
+ * manifest, or the current pointer. It supplies bytes and an attempt identity; the broker
+ * re-derives the catalogue from those bytes with the same code the old discovery stage used.
+ *
+ * The ordering guarantees are unchanged from the queue-driven publisher and are what make a
  * half-built snapshot harmless: every child object is created with `If-None-Match: *`, the
  * manifest is written only once every expected PDF is proven present, and `current.json` is
- * compare-and-swapped last against the ETag discovery observed. A snapshot that never finishes
- * simply stays out of `current.json` forever.
+ * compare-and-swapped last against the ETag the publication observed when it opened. A
+ * publication that never finishes simply stays out of `current.json` forever.
  *
  * The broker stays a transport. It mirrors every strictly-valid official timetable PDF the
  * authoritative page references and never tries to read a course year, semester or revision out
@@ -20,7 +25,7 @@
  */
 
 import { extractOfficialPdfUrls, getPdfFilename } from "./extractor";
-import { buildFinalizeJob, buildIngestJob, fileIdForIndex, qualifiedPdfFilename, validateJob } from "./jobs";
+import { buildFinalizeJob, fileIdForIndex, qualifiedPdfFilename, validatePendingFile } from "./jobs";
 import { isOfficialTimetablePdfUrl } from "../../worker-shared/fcim-policy";
 import {
   PENDING_MAX_AGE_MS, RECONCILE_PAGE_SIZE, RECONCILE_SCAN_PAGES,
@@ -29,31 +34,31 @@ import {
 import {
   CURRENT_KEY,
   PENDING_PREFIX,
+  operationKey,
   pendingCompletionKey,
   pendingDescriptorKey,
   snapshotManifestKey,
   snapshotPageApiKey,
   snapshotPdfKey,
 } from "./keys";
-import { fetchPageApi, readPageApiDocument, resolvePageApiUrl } from "./page-api";
-import { isRetryableUpstreamFailure, isRetryableUpstreamStatus, validatorOrNull } from "./http";
-import { fetchOfficialPdf, MAX_PDF_BYTES, PdfFetchError } from "./pdf-fetch";
+import { readPageApiDocument, resolvePageApiUrl } from "./page-api";
 import {
   buildCurrentPointer,
   normalizePageModifiedGmt,
   parseCurrentPointer,
+  WP_GMT_REGEX,
 } from "./pointer";
-import { contentLengthOrNull, isPayloadTooLarge, putLimitedStream } from "./stream-limit";
 import type {
   CompletionMarker,
-  DiscoveryResult,
   Env,
   FinalizeResult,
-  IngestPdfJob,
-  IngestResult,
+  OpenPublicationResult,
+  OperationRecord,
   PendingDescriptor,
   PendingFile,
   ParsedCurrentPointer,
+  PublicationPlan,
+  PublicationPlanFile,
   PublicationJob,
   ReconcileResult,
   SnapshotFile,
@@ -62,14 +67,25 @@ import type {
 
 const IF_NONE_MATCH_COND = { etagDoesNotMatch: "*" };
 
-/** Backstop finalize, in case every ingest's own finalize raced ahead of the last completion. */
-const FINALIZE_BACKSTOP_DELAY_SECONDS = 30;
-
 /** How many unfinished snapshots one reconcile invocation will re-drive. */
 const MAX_RECONCILED_SNAPSHOTS = 3;
 
-/** Leave a freshly scheduled snapshot alone; its own ingest jobs are still in flight. */
+/** Leave a freshly opened publication alone; its own uploads are still in flight. */
 const PENDING_MIN_AGE_MS = 5 * 60 * 1000;
+
+/** Default DF-03 tolerance for a Page API timestamp that leads broker time. */
+export const DEFAULT_MAX_PAGE_FUTURE_SKEW_HOURS = 26;
+
+/** How many publications may be open at once before the broker refuses to open another. */
+export const MAX_OPEN_PUBLICATIONS = 8;
+
+/** Bounded prefix scan used by the open-publication cap. */
+const OPEN_SCAN_PREFIX_LIMIT = 32;
+
+export const UUID_V4_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export const SHA256_HEX_REGEX = /^[a-f0-9]{64}$/;
 
 /**
  * Generate a collision-safe snapshot identifier.
@@ -82,7 +98,7 @@ export function generateSnapshotId(now = new Date()): string {
 }
 
 /* ------------------------------------------------------------------ *
- * Stage 1: discovery
+ * Planning
  * ------------------------------------------------------------------ */
 
 async function loadPreviousManifest(
@@ -97,34 +113,6 @@ async function loadPreviousManifest(
   } catch {
     return null;
   }
-}
-
-/**
- * Conditionally revalidate the PDFs of the previous snapshot.
- *
- * Bodies are never read — a 304 means unchanged, a 200 means the upstream replaced a document
- * in place under the same URL, and anything else is an error rather than a quiet "unchanged".
- */
-async function anyPreviousPdfChanged(env: Env, manifest: SnapshotManifest): Promise<boolean> {
-  const checks = manifest.files.map(async (file) => {
-    const headers: Record<string, string> = {};
-    if (file.upstream_etag) headers["If-None-Match"] = file.upstream_etag;
-    if (file.upstream_last_modified) headers["If-Modified-Since"] = file.upstream_last_modified;
-
-    const res = await fetchOfficialPdf(env, file.source_url, headers);
-    // We only need the status; releasing the body keeps the subrequest from being held open.
-    await res.body?.cancel().catch(() => {});
-
-    if (res.status === 304) return false;
-    if (res.status === 200) return true;
-    throw new PdfFetchError(
-      `Conditional check for ${file.source_url} returned HTTP ${res.status}`,
-      res.status,
-    );
-  });
-
-  const results = await Promise.all(checks);
-  return results.some(Boolean);
 }
 
 /**
@@ -147,169 +135,415 @@ export function planSnapshotFiles(snapshotId: string, pdfUrls: readonly string[]
     }
     if (taken.has(filename)) filename = qualifiedPdfFilename(sourceUrl, fileIdForIndex(index));
     if (taken.has(filename)) throw new Error(`Cannot assign a unique PDF filename for ${sourceUrl}`);
-    const checked = validateJob(buildIngestJob({ snapshotId, fileId: fileIdForIndex(index), filename, sourceUrl }));
-    if (!checked.ok) throw new Error(`Invalid planned ingest: ${checked.error}`);
-    taken.add(filename);
-    return {
-      file_id: fileIdForIndex(index),
+    const fileId = fileIdForIndex(index);
+    const entry: PendingFile = {
+      file_id: fileId,
       filename,
       source_url: sourceUrl,
       r2_key: snapshotPdfKey(snapshotId, filename),
     };
+    const checked = validatePendingFile({ snapshot_id: snapshotId, ...entry });
+    if (!checked.ok) throw new Error(`Invalid planned file: ${checked.error}`);
+    taken.add(filename);
+    return entry;
   });
 }
 
-function sameUrlSet(a: readonly string[], b: readonly string[]): boolean {
-  if (a.length !== b.length) return false;
-  const set = new Set(a);
-  return b.every((url) => set.has(url));
+/* ------------------------------------------------------------------ *
+ * DF-03: temporal guards
+ * ------------------------------------------------------------------ */
+
+/** Parse a WordPress naive-GMT stamp, rejecting impossible calendar dates. */
+export function wpGmtInstant(value: string | null): number | null {
+  if (typeof value !== "string" || !WP_GMT_REGEX.test(value)) return null;
+  const ms = Date.parse(`${value}Z`);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toISOString() === `${value}.000Z` ? ms : null;
+}
+
+export type TemporalVerdict =
+  | { ok: true }
+  | { ok: false; status: 400 | 409; code: "stale_page" | "future_page"; error: string };
+
+/**
+ * Decide whether an incoming Page API timestamp may open a publication.
+ *
+ * Equal timestamps stay valid on purpose: FCIM replaces a PDF in place under an unchanged URL
+ * without touching the page, and refusing an equal stamp would make that change unpublishable.
+ * There is no bypass — no force flag, no header, no operator override on this path.
+ */
+export function evaluatePageTimestamp(
+  incoming: string | null,
+  baseline: string | null,
+  now: number,
+  maxFutureSkewMs: number,
+): TemporalVerdict {
+  const incomingMs = wpGmtInstant(incoming);
+
+  if (incomingMs !== null && incomingMs > now + maxFutureSkewMs) {
+    return {
+      ok: false,
+      status: 400,
+      code: "future_page",
+      error: "Page API modified_gmt leads broker time by more than the permitted skew",
+    };
+  }
+
+  const baselineMs = wpGmtInstant(baseline);
+  if (baselineMs === null) {
+    // No usable baseline: nothing can be proven stale against it.
+    return { ok: true };
+  }
+
+  if (incomingMs === null) {
+    return {
+      ok: false,
+      status: 409,
+      code: "stale_page",
+      error: "Page API payload has no usable modified_gmt but the current snapshot does",
+    };
+  }
+
+  if (incomingMs < baselineMs) {
+    return {
+      ok: false,
+      status: 409,
+      code: "stale_page",
+      error: "Page API modified_gmt is older than the current snapshot's",
+    };
+  }
+
+  return { ok: true };
+}
+
+export function maxPageFutureSkewMs(env: Env): number {
+  const raw = env.MAX_PAGE_FUTURE_SKEW_HOURS;
+  if (typeof raw === "string" && /^(?:0|[1-9]\d{0,3})$/.test(raw)) {
+    return Number(raw) * 60 * 60 * 1000;
+  }
+  return DEFAULT_MAX_PAGE_FUTURE_SKEW_HOURS * 60 * 60 * 1000;
+}
+
+/* ------------------------------------------------------------------ *
+ * Descriptors
+ * ------------------------------------------------------------------ */
+
+export async function readDescriptor(env: Env, snapshotId: string): Promise<PendingDescriptor | null> {
+  const obj = await env.R2_BUCKET.get(pendingDescriptorKey(snapshotId));
+  if (!obj) return null;
+  try {
+    const descriptor = (await obj.json()) as PendingDescriptor;
+    return descriptor.snapshot_id === snapshotId ? descriptor : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Deterministic descriptor failures never generate poison work or reach publication. */
+export function descriptorFileError(descriptor: PendingDescriptor): string | null {
+  if (!Array.isArray(descriptor.files) || descriptor.files.length === 0) return "Invalid descriptor file set";
+  const ids = new Set<string>();
+  const keys = new Set<string>();
+  for (const file of descriptor.files) {
+    if (!file || typeof file !== "object") return "Invalid descriptor file entry";
+    const checked = validatePendingFile({ snapshot_id: descriptor.snapshot_id, ...file });
+    if (!checked.ok) return `Descriptor holds an invalid file entry: ${checked.error}`;
+    if (ids.has(file.file_id) || keys.has(file.r2_key)) return "Duplicate descriptor file ID or key";
+    ids.add(file.file_id);
+    keys.add(file.r2_key);
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Stage 1: open a publication
+ * ------------------------------------------------------------------ */
+
+function planFrom(descriptor: PendingDescriptor, stored: ReadonlySet<string>): PublicationPlan {
+  const files: PublicationPlanFile[] = descriptor.files.map((file) => ({
+    file_id: file.file_id,
+    filename: file.filename,
+    source_url: file.source_url,
+    upload_path: `/publications/${descriptor.snapshot_id}/files/${file.file_id}`,
+    status: stored.has(file.file_id) ? "stored" : "needed",
+  }));
+  const created = snapshotIdInstant(descriptor.snapshot_id);
+  return {
+    snapshot_id: descriptor.snapshot_id,
+    operation_id: descriptor.operation_id,
+    page_api_sha256: descriptor.page_api_sha256,
+    created_at: descriptor.created_at,
+    expires_at: new Date((created ?? Date.now()) + PENDING_MAX_AGE_MS).toISOString(),
+    files,
+  };
+}
+
+/** Which planned files already have a completion marker, so a resumed run can skip them. */
+export async function storedFileIds(env: Env, descriptor: PendingDescriptor): Promise<Set<string>> {
+  const found = await Promise.all(
+    descriptor.files.map(async (file) => ({
+      fileId: file.file_id,
+      present: (await env.R2_BUCKET.head(pendingCompletionKey(descriptor.snapshot_id, file.file_id))) !== null,
+    })),
+  );
+  return new Set(found.filter((entry) => entry.present).map((entry) => entry.fileId));
+}
+
+async function readOperation(env: Env, operationId: string): Promise<OperationRecord | null> {
+  const obj = await env.R2_BUCKET.get(operationKey(operationId));
+  if (!obj) return null;
+  try {
+    const record = (await obj.json()) as OperationRecord;
+    return record && record.operation_id === operationId ? record : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Discovery: decide whether a new snapshot is warranted, and if so fix its complete expected
- * file set in an immutable descriptor and schedule one bounded ingest job per PDF.
+ * Resume, refuse or expire an attempt whose operation record already exists (DF-01 / DF-06).
  *
- * It never downloads a PDF body, never writes a manifest and never touches `current.json`.
+ * A mismatched payload hash never mutates anything and never reveals which snapshot the original
+ * attempt created: a client that is confused about its own identity must not be handed a handle
+ * to somebody else's publication.
  */
-export async function runDiscovery(
+async function resumeOperation(
   env: Env,
-  options: { force?: boolean } = {},
-): Promise<DiscoveryResult> {
+  record: OperationRecord,
+  pageApiSha256: string,
+): Promise<OpenPublicationResult> {
+  if (record.page_api_sha256 !== pageApiSha256) {
+    return {
+      ok: false,
+      status: 409,
+      code: "operation_payload_mismatch",
+      error: "This operation id was already used with different Page API bytes",
+    };
+  }
+
+  const descriptor = await readDescriptor(env, record.snapshot_id);
+  if (!descriptor) {
+    return {
+      ok: false,
+      status: 410,
+      code: "operation_expired",
+      error: "The publication this operation opened is no longer available",
+    };
+  }
+
+  if (
+    descriptor.operation_id !== record.operation_id ||
+    descriptor.page_api_sha256 !== record.page_api_sha256
+  ) {
+    return {
+      ok: false,
+      status: 409,
+      code: "operation_state_corrupt",
+      error: "Operation record and publication descriptor disagree",
+    };
+  }
+
+  const descriptorError = descriptorFileError(descriptor);
+  if (descriptorError) {
+    return { ok: false, status: 409, code: "operation_state_corrupt", error: descriptorError };
+  }
+
+  return {
+    ok: true,
+    status: "resumed",
+    plan: planFrom(descriptor, await storedFileIds(env, descriptor)),
+  };
+}
+
+/**
+ * Count publications that are open right now.
+ *
+ * Snapshot ids are ISO-prefixed and a publication may only live for six hours, so every open
+ * publication is under today's or yesterday's date prefix. Scanning exactly those two prefixes
+ * keeps the check bounded and — unlike a plain `pending/` listing, which returns the oldest keys
+ * first — actually looks at the publications that could still be open.
+ */
+export async function countOpenPublications(env: Env, now: number): Promise<number> {
+  const days = [new Date(now), new Date(now - 24 * 60 * 60 * 1000)].map(
+    (date) => date.toISOString().slice(0, 10),
+  );
+  const ids = new Set<string>();
+  for (const day of days) {
+    const listing = await env.R2_BUCKET.list({
+      prefix: `${PENDING_PREFIX}${day}`,
+      delimiter: "/",
+      limit: OPEN_SCAN_PREFIX_LIMIT,
+    });
+    for (const prefix of listing.delimitedPrefixes) {
+      const id = prefix.slice(PENDING_PREFIX.length).replace(/\/$/, "");
+      const created = snapshotIdInstant(id);
+      if (created === null || now - created > PENDING_MAX_AGE_MS) continue;
+      ids.add(id);
+    }
+  }
+
+  let open = 0;
+  for (const id of ids) {
+    if (await env.R2_BUCKET.head(snapshotManifestKey(id))) continue; // already closed
+    open++;
+  }
+  return open;
+}
+
+export interface OpenPublicationInput {
+  operationId: string;
+  pageApiSha256: string;
+  pageBytes: Uint8Array;
+  now?: Date;
+}
+
+/**
+ * Open a publication from publisher-supplied Page API bytes.
+ *
+ * The broker independently re-reads the document, re-extracts the official PDF catalogue and
+ * plans the snapshot. The publisher's only inputs are the bytes and its own attempt id.
+ */
+export async function openPublication(
+  env: Env,
+  input: OpenPublicationInput,
+): Promise<OpenPublicationResult> {
+  if (!UUID_V4_REGEX.test(input.operationId)) {
+    return { ok: false, status: 400, code: "invalid_operation_id", error: "Operation id must be a UUIDv4" };
+  }
+  if (!SHA256_HEX_REGEX.test(input.pageApiSha256)) {
+    return { ok: false, status: 400, code: "invalid_page_hash", error: "Page hash must be lowercase SHA-256 hex" };
+  }
+
+  const existing = await readOperation(env, input.operationId);
+  if (existing) {
+    return resumeOperation(env, existing, input.pageApiSha256);
+  }
+
   let pageApiUrl: string;
   try {
     pageApiUrl = resolvePageApiUrl(env.FCIM_PAGE_API_URL);
   } catch (err) {
-    return { outcome: "error", error: (err as Error).message };
+    return { ok: false, status: 500, code: "broker_misconfigured", error: (err as Error).message };
   }
 
-  const currentObj = await env.R2_BUCKET.get(CURRENT_KEY);
-  const currentEtag = currentObj?.etag ?? null;
-
-  let previousPointer: ParsedCurrentPointer | null = null;
-  if (currentObj) {
-    const parsed = parseCurrentPointer(await currentObj.text());
-    if (parsed.ok) {
-      previousPointer = parsed.pointer;
-    } else {
-      // No field is salvaged from an unusable pointer. The ETag is still honoured, so a
-      // concurrent well-formed publisher can never be overwritten by this cycle.
-      console.warn(`current.json rejected by strict pointer validation: ${parsed.error}`);
-    }
-  }
-
-  const previousManifest = previousPointer ? await loadPreviousManifest(env, previousPointer) : null;
-
-  let pageBytes: Uint8Array;
-  let pageEtag: string | null = null;
-  let pageLastModified: string | null = null;
-  try {
-    const first = await fetchPageApi(env, pageApiUrl, {
-      etag: previousManifest?.source.etag,
-      lastModified: previousManifest?.source.last_modified,
-    });
-
-    if (first.notModified) {
-      if (!options.force && previousManifest) {
-        if (!(await anyPreviousPdfChanged(env, previousManifest))) {
-          return {
-            outcome: "unchanged",
-            previous_snapshot_id: previousPointer?.snapshot_id ?? null,
-            reason: "page 304 and every mirrored PDF 304",
-          };
-        }
-      }
-      // Something moved (or a forced run): we need the full body to rebuild the catalogue.
-      const full = await fetchPageApi(env, pageApiUrl);
-      if (full.notModified || !full.bytes) {
-        return { outcome: "error", error: "Page API answered 304 to an unconditional request" };
-      }
-      pageBytes = full.bytes;
-      pageEtag = full.etag;
-      pageLastModified = full.lastModified;
-    } else {
-      if (!first.bytes) {
-        return { outcome: "error", error: "Page API returned no body" };
-      }
-      pageBytes = first.bytes;
-      pageEtag = first.etag;
-      pageLastModified = first.lastModified;
-    }
-  } catch (err) {
-    // Every failure means the upstream state is unknown, never "unchanged". The result also
-    // distinguishes transient network/403/429/5xx failures from deterministic policy/schema
-    // failures so the queue does not burn retries on a job that cannot recover.
-    return {
-      outcome: "error",
-      error: (err as Error).message,
-      retryable: isRetryableUpstreamFailure(err),
-    };
-  }
-
-  const rawText = new TextDecoder().decode(pageBytes);
   let pageId: number | null;
   let pageModifiedGmt: string | null;
   let renderedHtml: string;
   try {
-    const doc = readPageApiDocument(rawText);
+    const doc = readPageApiDocument(new TextDecoder().decode(input.pageBytes));
     pageId = doc.pageId;
     pageModifiedGmt = normalizePageModifiedGmt(doc.pageModifiedGmt);
     renderedHtml = doc.renderedHtml;
   } catch (err) {
-    return { outcome: "error", error: (err as Error).message };
+    return { ok: false, status: 400, code: "invalid_page_payload", error: (err as Error).message };
   }
 
-  // Transport catalogue: every strictly-valid official timetable PDF the page references.
-  // No filename is interpreted; Render selects the timetable that matters for a course year.
   const pdfUrls = extractOfficialPdfUrls(renderedHtml);
   if (pdfUrls.length === 0) {
-    return { outcome: "error", error: "No official timetable PDF URLs found in Page API content" };
+    return {
+      ok: false,
+      status: 400,
+      code: "no_official_pdfs",
+      error: "No official timetable PDF URLs found in the Page API content",
+    };
   }
 
-  if (!options.force && previousPointer && previousManifest) {
-    // Legacy pointers do not carry Page API metadata. The immutable manifest is authoritative
-    // for both legacy and strict pointers, so no compatibility value has to be invented.
-    const previousPageModifiedGmt = previousManifest.source.page_modified_gmt;
-    const pageUnchanged =
-      previousPageModifiedGmt !== null && previousPageModifiedGmt === pageModifiedGmt;
-    const catalogueUnchanged = sameUrlSet(
-      pdfUrls,
-      previousManifest.files.map((f) => f.source_url),
-    );
+  const currentObj = await env.R2_BUCKET.get(CURRENT_KEY);
+  const currentEtag = currentObj?.etag ?? null;
+  let previousPointer: ParsedCurrentPointer | null = null;
+  if (currentObj) {
+    const parsed = parseCurrentPointer(await currentObj.text());
+    if (!parsed.ok) {
+      // Fail closed. A pointer the broker cannot read is also a pointer it cannot prove a new
+      // publication is newer than, and retention and reconciliation are already stalled on it.
+      console.error(`current.json rejected by strict pointer validation: ${parsed.error}`);
+      return {
+        ok: false,
+        status: 503,
+        code: "broker_state_unreadable",
+        error: "The broker cannot read its own current pointer",
+      };
+    }
+    previousPointer = parsed.pointer;
+  }
 
-    if (pageUnchanged && catalogueUnchanged) {
-      try {
-        if (!(await anyPreviousPdfChanged(env, previousManifest))) {
-          return {
-            outcome: "unchanged",
-            previous_snapshot_id: previousPointer.snapshot_id,
-            reason: "page modified_gmt and PDF catalogue unchanged, every mirrored PDF 304",
-          };
-        }
-      } catch (err) {
-        return {
-          outcome: "error",
-          error: (err as Error).message,
-          retryable: isRetryableUpstreamFailure(err),
-        };
-      }
+  let baseline: string | null = null;
+  if (previousPointer) {
+    baseline = previousPointer.page_modified_gmt ?? null;
+    if (baseline === null) {
+      // A legacy four-field pointer carries no Page API metadata; the immutable manifest does.
+      const manifest = await loadPreviousManifest(env, previousPointer);
+      baseline = manifest?.source.page_modified_gmt ?? null;
     }
   }
 
-  const snapshotId = generateSnapshotId();
-  const createdAt = new Date().toISOString();
+  const now = input.now ?? new Date();
+  const verdict = evaluatePageTimestamp(pageModifiedGmt, baseline, now.getTime(), maxPageFutureSkewMs(env));
+  if (!verdict.ok) {
+    return { ok: false, status: verdict.status, code: verdict.code, error: verdict.error };
+  }
+
+  if ((await countOpenPublications(env, now.getTime())) >= MAX_OPEN_PUBLICATIONS) {
+    return {
+      ok: false,
+      status: 429,
+      code: "too_many_open_publications",
+      error: `At most ${MAX_OPEN_PUBLICATIONS} publications may be open at once`,
+    };
+  }
+
+  const snapshotId = generateSnapshotId(now);
+  const createdAt = now.toISOString();
 
   let files: PendingFile[];
-  try { files = planSnapshotFiles(snapshotId, pdfUrls); }
-  catch (err) { return { outcome: "error", error: (err as Error).message, retryable: false }; }
+  try {
+    files = planSnapshotFiles(snapshotId, pdfUrls);
+  } catch (err) {
+    return { ok: false, status: 400, code: "unplannable_catalogue", error: (err as Error).message };
+  }
 
-  const pageApiWritten = await env.R2_BUCKET.put(snapshotPageApiKey(snapshotId), pageBytes, {
+  // The operation record is written before any snapshot state so the mapping from attempt to
+  // snapshot is durable first. A crash after this point and before the descriptor lands leaves
+  // the attempt expired rather than ambiguous, which the publisher recovers from with a new id.
+  const record: OperationRecord = {
+    schema_version: 1,
+    operation_id: input.operationId,
+    snapshot_id: snapshotId,
+    page_api_sha256: input.pageApiSha256,
+    created_at: createdAt,
+  };
+  const recordWritten = await env.R2_BUCKET.put(
+    operationKey(input.operationId),
+    JSON.stringify(record),
+    { onlyIf: IF_NONE_MATCH_COND, httpMetadata: { contentType: "application/json" } },
+  );
+  if (!recordWritten) {
+    const raced = await readOperation(env, input.operationId);
+    if (!raced) {
+      return {
+        ok: false,
+        status: 409,
+        code: "operation_state_corrupt",
+        error: "Operation record exists but cannot be read",
+      };
+    }
+    return resumeOperation(env, raced, input.pageApiSha256);
+  }
+
+  const pageApiWritten = await env.R2_BUCKET.put(snapshotPageApiKey(snapshotId), input.pageBytes, {
     onlyIf: IF_NONE_MATCH_COND,
     httpMetadata: { contentType: "application/json" },
+    customMetadata: {
+      snapshot_id: snapshotId,
+      operation_id: input.operationId,
+      page_api_sha256: input.pageApiSha256,
+    },
   });
   if (!pageApiWritten) {
     return {
-      outcome: "error",
-      snapshot_id: snapshotId,
+      ok: false,
+      status: 409,
+      code: "snapshot_collision",
       error: `Collision: ${snapshotPageApiKey(snapshotId)} already exists under an immutable snapshot`,
     };
   }
@@ -320,13 +554,17 @@ export async function runDiscovery(
     previous_snapshot_id: previousPointer?.snapshot_id ?? null,
     created_at: createdAt,
     current_etag: currentEtag,
+    operation_id: input.operationId,
+    page_api_sha256: input.pageApiSha256,
+    origin: "md_publisher",
     source: {
       page_api_url: pageApiUrl,
       page_id: pageId,
       page_modified_gmt: pageModifiedGmt,
       retrieved_at: createdAt,
-      etag: pageEtag,
-      last_modified: pageLastModified,
+      // DF-02: a publisher-observed HTTP validator never becomes a trusted one.
+      etag: null,
+      last_modified: null,
     },
     files,
   };
@@ -338,283 +576,14 @@ export async function runDiscovery(
   );
   if (!descriptorWritten) {
     return {
-      outcome: "error",
-      snapshot_id: snapshotId,
+      ok: false,
+      status: 409,
+      code: "snapshot_collision",
       error: `Collision: pending descriptor for ${snapshotId} already exists`,
     };
   }
 
-  const messages: { body: PublicationJob; delaySeconds?: number }[] = files.map((file) => ({
-    body: buildIngestJob({
-      snapshotId,
-      fileId: file.file_id,
-      filename: file.filename,
-      sourceUrl: file.source_url,
-    }),
-  }));
-  messages.push({
-    body: buildFinalizeJob(snapshotId),
-    delaySeconds: FINALIZE_BACKSTOP_DELAY_SECONDS,
-  });
-
-  await env.PUBLICATION_QUEUE.sendBatch(messages);
-
-  return {
-    outcome: "scheduled",
-    snapshot_id: snapshotId,
-    previous_snapshot_id: previousPointer?.snapshot_id ?? null,
-    files: files.length,
-  };
-}
-
-/* ------------------------------------------------------------------ *
- * Stage 2: one PDF per invocation
- * ------------------------------------------------------------------ */
-
-async function readDescriptor(env: Env, snapshotId: string): Promise<PendingDescriptor | null> {
-  const obj = await env.R2_BUCKET.get(pendingDescriptorKey(snapshotId));
-  if (!obj) return null;
-  try {
-    const descriptor = (await obj.json()) as PendingDescriptor;
-    return descriptor.snapshot_id === snapshotId ? descriptor : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Deterministic descriptor failures never generate poison ingest work or reach publication. */
-function descriptorJobError(descriptor: PendingDescriptor): string | null {
-  if (!Array.isArray(descriptor.files) || descriptor.files.length === 0) return "Invalid descriptor file set";
-  const ids = new Set<string>();
-  const keys = new Set<string>();
-  for (const file of descriptor.files) {
-    if (!file || typeof file !== "object") return "Invalid descriptor file entry";
-    const checked = validateJob({ schema_version: 1, kind: "ingest_pdf", snapshot_id: descriptor.snapshot_id,
-      file_id: file.file_id, filename: file.filename, source_url: file.source_url, r2_key: file.r2_key });
-    if (!checked.ok) return `Descriptor cannot produce valid ingest job: ${checked.error}`;
-    if (ids.has(file.file_id) || keys.has(file.r2_key)) return "Duplicate descriptor file ID or key";
-    ids.add(file.file_id);
-    keys.add(file.r2_key);
-  }
-  return null;
-}
-
-function markerFor(
-  job: IngestPdfJob,
-  meta: { contentType: string | null; size: number | null; etag: string | null; lastModified: string | null },
-): CompletionMarker {
-  return {
-    schema_version: 1,
-    snapshot_id: job.snapshot_id,
-    file_id: job.file_id,
-    filename: job.filename,
-    source_url: job.source_url,
-    r2_key: job.r2_key,
-    content_type: meta.contentType,
-    size: meta.size,
-    upstream_etag: meta.etag,
-    upstream_last_modified: meta.lastModified,
-    completed_at: new Date().toISOString(),
-  };
-}
-
-/**
- * Ingest exactly one PDF into its immutable snapshot object.
- *
- * It parses nothing, hashes nothing, selects no course and never touches `current.json`: it
- * streams one body into one create-only key and records an immutable completion marker.
- * Re-running the same job is safe — an object that already exists with the metadata this job
- * would have written is a success, and one that exists with different provenance is a failure.
- */
-export async function runPdfIngest(env: Env, job: IngestPdfJob): Promise<IngestResult> {
-  if (snapshotWorkExpired(job.snapshot_id)) {
-    return { outcome: "error", snapshot_id: job.snapshot_id, file_id: job.file_id,
-      error: "Snapshot publication window expired", retryable: false };
-  }
-  const descriptor = await readDescriptor(env, job.snapshot_id);
-  if (!descriptor) {
-    return {
-      outcome: "error",
-      snapshot_id: job.snapshot_id,
-      file_id: job.file_id,
-      error: `No pending descriptor for snapshot ${job.snapshot_id}`,
-    };
-  }
-
-  const descriptorError = descriptorJobError(descriptor);
-  if (descriptorError) return { outcome: "error", snapshot_id: job.snapshot_id, file_id: job.file_id,
-    error: descriptorError, retryable: false };
-  const expected = descriptor.files.find((f) => f.file_id === job.file_id);
-  if (
-    !expected ||
-    expected.filename !== job.filename ||
-    expected.source_url !== job.source_url ||
-    expected.r2_key !== job.r2_key
-  ) {
-    return {
-      outcome: "error",
-      snapshot_id: job.snapshot_id,
-      file_id: job.file_id,
-      error: `Job does not match the pending descriptor entry for ${job.file_id}`,
-    };
-  }
-
-  const completionKey = pendingCompletionKey(job.snapshot_id, job.file_id);
-
-  const existing = await env.R2_BUCKET.head(job.r2_key);
-  if (existing) {
-    if (existing.customMetadata?.source_url !== job.source_url) {
-      return {
-        outcome: "conflict",
-        snapshot_id: job.snapshot_id,
-        file_id: job.file_id,
-        error: `Unexpected collision: ${job.r2_key} exists with different provenance`,
-      };
-    }
-    await env.R2_BUCKET.put(
-      completionKey,
-      JSON.stringify(
-        markerFor(job, {
-          contentType: existing.httpMetadata?.contentType ?? null,
-          size: existing.size,
-          etag: existing.customMetadata?.upstream_etag ?? null,
-          lastModified: existing.customMetadata?.upstream_last_modified ?? null,
-        }),
-      ),
-      { onlyIf: IF_NONE_MATCH_COND, httpMetadata: { contentType: "application/json" } },
-    );
-    await env.PUBLICATION_QUEUE.send(buildFinalizeJob(job.snapshot_id));
-    return {
-      outcome: "already_ingested",
-      snapshot_id: job.snapshot_id,
-      file_id: job.file_id,
-      r2_key: job.r2_key,
-      size: existing.size,
-    };
-  }
-
-  let response: Response;
-  try {
-    response = await fetchOfficialPdf(env, job.source_url);
-  } catch (err) {
-    return {
-      outcome: "error",
-      snapshot_id: job.snapshot_id,
-      file_id: job.file_id,
-      error: (err as Error).message,
-      retryable: isRetryableUpstreamFailure(err),
-    };
-  }
-
-  if (response.status !== 200) {
-    return {
-      outcome: "error",
-      snapshot_id: job.snapshot_id,
-      file_id: job.file_id,
-      error: `PDF ${job.source_url} returned HTTP ${response.status}`,
-      retryable: isRetryableUpstreamStatus(response.status),
-    };
-  }
-  if (!response.body) {
-    return {
-      outcome: "error",
-      snapshot_id: job.snapshot_id,
-      file_id: job.file_id,
-      error: `PDF ${job.source_url} returned an empty body`,
-    };
-  }
-
-  const contentType = response.headers.get("Content-Type") || "application/pdf";
-  const upstreamEtag = validatorOrNull(response.headers.get("ETag"));
-  const upstreamLastModified = validatorOrNull(response.headers.get("Last-Modified"));
-  const declaredLength = response.headers.get("Content-Length");
-  const declaredSize = contentLengthOrNull(declaredLength);
-  if (declaredSize !== null && declaredSize > MAX_PDF_BYTES) {
-    return {
-      outcome: "error",
-      snapshot_id: job.snapshot_id,
-      file_id: job.file_id,
-      error: `PDF ${job.source_url} declares ${declaredSize} bytes, over the ${MAX_PDF_BYTES} byte limit`,
-    };
-  }
-
-  const customMetadata: Record<string, string> = {
-    snapshot_id: job.snapshot_id,
-    file_id: job.file_id,
-    source_url: job.source_url,
-  };
-  if (upstreamEtag) customMetadata.upstream_etag = upstreamEtag;
-  if (upstreamLastModified) customMetadata.upstream_last_modified = upstreamLastModified;
-
-  let written: Awaited<ReturnType<Env["R2_BUCKET"]["put"]>>;
-  try {
-    written = await putLimitedStream(
-      response.body as ReadableStream<Uint8Array>,
-      MAX_PDF_BYTES,
-      declaredSize,
-      (body) =>
-        env.R2_BUCKET.put(job.r2_key, body, {
-          onlyIf: IF_NONE_MATCH_COND,
-          httpMetadata: { contentType },
-          customMetadata,
-        }),
-    );
-  } catch (err) {
-    return {
-      outcome: "error",
-      snapshot_id: job.snapshot_id,
-      file_id: job.file_id,
-      error: isPayloadTooLarge(err)
-        ? `PDF ${job.source_url} exceeds the ${MAX_PDF_BYTES} byte limit`
-        : (err as Error).message,
-      retryable: !isPayloadTooLarge(err),
-    };
-  }
-
-  if (!written) {
-    // A concurrent delivery of the same job won the create race; that is still success as long
-    // as the object it created is the one this job was asked to produce.
-    const raced = await env.R2_BUCKET.head(job.r2_key);
-    if (!raced || raced.customMetadata?.source_url !== job.source_url) {
-      return {
-        outcome: "conflict",
-        snapshot_id: job.snapshot_id,
-        file_id: job.file_id,
-        error: `Unexpected collision: ${job.r2_key} already exists under an immutable snapshot`,
-      };
-    }
-    await env.PUBLICATION_QUEUE.send(buildFinalizeJob(job.snapshot_id));
-    return {
-      outcome: "already_ingested",
-      snapshot_id: job.snapshot_id,
-      file_id: job.file_id,
-      r2_key: job.r2_key,
-      size: raced.size,
-    };
-  }
-
-  await env.R2_BUCKET.put(
-    completionKey,
-    JSON.stringify(
-      markerFor(job, {
-        contentType,
-        size: written.size,
-        etag: upstreamEtag,
-        lastModified: upstreamLastModified,
-      }),
-    ),
-    { onlyIf: IF_NONE_MATCH_COND, httpMetadata: { contentType: "application/json" } },
-  );
-
-  await env.PUBLICATION_QUEUE.send(buildFinalizeJob(job.snapshot_id));
-
-  return {
-    outcome: "ingested",
-    snapshot_id: job.snapshot_id,
-    file_id: job.file_id,
-    r2_key: job.r2_key,
-    size: written.size,
-  };
+  return { ok: true, status: "created", plan: planFrom(descriptor, new Set()) };
 }
 
 /* ------------------------------------------------------------------ *
@@ -633,8 +602,8 @@ async function currentPointsAt(env: Env, snapshotId: string): Promise<boolean> {
  *
  * A snapshot may become current only when its page-api payload, every descriptor file, every
  * completion marker and the manifest all exist and agree. Anything less returns `incomplete`,
- * which is a normal state and not an error — the missing ingest jobs are still in flight or will
- * be re-driven by reconciliation.
+ * which is a normal state and not an error — the missing uploads are still in flight, or the
+ * publisher will resume them.
  */
 export async function runFinalize(env: Env, snapshotId: string): Promise<FinalizeResult> {
   if (await currentPointsAt(env, snapshotId)) {
@@ -654,7 +623,7 @@ export async function runFinalize(env: Env, snapshotId: string): Promise<Finaliz
     };
   }
 
-  const descriptorError = descriptorJobError(descriptor);
+  const descriptorError = descriptorFileError(descriptor);
   if (descriptorError) return { outcome: "error", snapshot_id: snapshotId, error: descriptorError, retryable: false };
   const pageApi = await env.R2_BUCKET.head(snapshotPageApiKey(snapshotId));
   if (!pageApi) {
@@ -667,6 +636,7 @@ export async function runFinalize(env: Env, snapshotId: string): Promise<Finaliz
 
   const missing: string[] = [];
   const files: SnapshotFile[] = [];
+  const publisherAuthored = descriptor.origin === "md_publisher";
 
   const inspected = await Promise.all(
     descriptor.files.map(async (file) => ({
@@ -717,8 +687,13 @@ export async function runFinalize(env: Env, snapshotId: string): Promise<Finaliz
       r2_key: file.r2_key,
       content_type: parsedMarker.content_type,
       size: object.size,
-      upstream_etag: parsedMarker.upstream_etag,
-      upstream_last_modified: parsedMarker.upstream_last_modified,
+      // DF-02: for publisher-authored snapshots the trusted validators are unconditionally null,
+      // whatever a marker claims. Render's ETag fast-path must stay unreachable for these files.
+      upstream_etag: publisherAuthored ? null : parsedMarker.upstream_etag,
+      upstream_last_modified: publisherAuthored ? null : parsedMarker.upstream_last_modified,
+      publisher_observed_etag: parsedMarker.publisher_observed_etag ?? null,
+      publisher_observed_last_modified: parsedMarker.publisher_observed_last_modified ?? null,
+      content_sha256: parsedMarker.content_sha256 ?? null,
     });
   }
 
@@ -796,8 +771,12 @@ export async function runFinalize(env: Env, snapshotId: string): Promise<Finaliz
  * ------------------------------------------------------------------ */
 
 /**
- * Re-drive recent pending snapshots whose ingest jobs never finished — the safety net for a
- * job that exhausted its queue retries and landed in the dead-letter queue.
+ * Re-drive recent publications whose finalize never ran, and run bounded retention.
+ *
+ * Gate F narrowed this stage hard: it never fetches FCIM and never asks for a PDF body. A
+ * publication that is still missing uploads is left alone — only the publisher can supply those
+ * bytes, and it is the publisher's own retry that will do so. Re-driving finalize is safe because
+ * finalize reads storage and nothing else.
  */
 export async function runReconcile(env: Env): Promise<ReconcileResult> {
   const bucket = env.R2_BUCKET;
@@ -818,7 +797,7 @@ export async function runReconcile(env: Env): Promise<ReconcileResult> {
     }
   } catch (err) {
     return {
-      outcome: "error", pending_examined: 0, requeued_ingests: 0, requeued_finalizes: 0,
+      outcome: "error", pending_examined: 0, requeued_finalizes: 0,
       error: (err as Error).message, retryable: true,
     };
   }
@@ -835,7 +814,6 @@ export async function runReconcile(env: Env): Promise<ReconcileResult> {
     .sort()
     .reverse();
 
-  let requeuedIngests = 0;
   let requeuedFinalizes = 0;
 
   for (const snapshotId of candidates) {
@@ -847,33 +825,17 @@ export async function runReconcile(env: Env): Promise<ReconcileResult> {
     if (!descriptor) continue;
 
     // A descriptor can only win the CAS while current.json still has exactly the ETag it observed
-    // at discovery. Once that changes, fetching its missing PDFs would create load for a snapshot
-    // that is already provably superseded, so leave it as harmless immutable history.
+    // when the publication opened. Once that changes, re-driving it would create load for a
+    // snapshot that is already provably superseded, so leave it as harmless immutable history.
     if (descriptor.current_etag !== (current?.etag ?? null)) continue;
-    const descriptorError = descriptorJobError(descriptor);
+    const descriptorError = descriptorFileError(descriptor);
     if (descriptorError) {
       console.error(`Snapshot ${snapshotId} deterministically failed: ${descriptorError}`);
       continue;
     }
 
-    const pending: { body: PublicationJob }[] = [];
-    for (const file of descriptor.files) {
-      const marker = await env.R2_BUCKET.head(pendingCompletionKey(snapshotId, file.file_id));
-      if (!marker) {
-        pending.push({
-          body: buildIngestJob({
-            snapshotId,
-            fileId: file.file_id,
-            filename: file.filename,
-            sourceUrl: file.source_url,
-          }),
-        });
-      }
-    }
-
-    pending.push({ body: buildFinalizeJob(snapshotId) });
-    await env.PUBLICATION_QUEUE.sendBatch(pending);
-    requeuedIngests += pending.length - 1;
+    const jobs: { body: PublicationJob }[] = [{ body: buildFinalizeJob(snapshotId) }];
+    await env.PUBLICATION_QUEUE.sendBatch(jobs);
     requeuedFinalizes += 1;
   }
 
@@ -882,9 +844,8 @@ export async function runReconcile(env: Env): Promise<ReconcileResult> {
   await runRetention(env);
 
   return {
-    outcome: requeuedIngests + requeuedFinalizes > 0 ? "requeued" : "idle",
+    outcome: requeuedFinalizes > 0 ? "requeued" : "idle",
     pending_examined: candidates.length,
-    requeued_ingests: requeuedIngests,
     requeued_finalizes: requeuedFinalizes,
   };
 }
