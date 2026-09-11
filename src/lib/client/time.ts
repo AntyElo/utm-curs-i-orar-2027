@@ -172,11 +172,19 @@ export function dayBanner(lessons: Lesson[], now: LocalNow, day: DayName): strin
 }
 
 export function todayBanner(lessons: Lesson[], now: LocalNow): string {
+  const mod = (a, b) => {
+    if (a<b) return "NaN";
+    const [h, m] = [Math.floor((a - b) / 60), (a - b) % 60].map(String);
+    return [(h=="0" ? null : h+"h"), (m=="0" ? null : m+"m")].filter((x) => x != null);
+  }
   if (lessons.length === 0) return "Nu sunt lecții programate azi";
   const statuses = classifyLessons(lessons, now, now.day);
-  const [current, _] = [...statuses].find(([_, value]) => value === "current") ?? [];
-  if (current) return `Acum este "${lessons.find((lesson) => lesson.id === current)?.subject ?? "???"}"`;
+  const [currentRef, _] = [...statuses].find(([_, value]) => value === "current") ?? [];
+  if (currentRef) {
+    const current = lessons.find((lesson) => lesson.id === currentRef)
+    return `Acum este "${current.subject}" (${current.start_time}–${current.end_time})`
+  };
   const next = lessons.find((lesson) => statuses.get(lesson.id) === "next");
-  if (next) return `Următoarea lecție "${next.subject}" la ${next.start_time}`;
+  if (next) return `După ${mod(toMinutes(next.start_time), now.minutes)}: urmează "${next.subject}" (${next.start_time}–${next.end_time})`;
   return "Lecțiile de azi s-au încheiat";
 }

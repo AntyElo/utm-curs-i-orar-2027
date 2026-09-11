@@ -392,7 +392,7 @@ function GroupSchedule({ group, days, lessons, view, activeDay, todayName, onSel
           {now.dateLabel} · {now.timeLabel} (Chișinău)
         </p>
         <WeekBadge week={week} />
-        <p className="mb-3 rounded-lg bg-slate-100 px-3 py-2 text-sm text-slate-700">{todayBanner(lessonsThisWeek(lessons, week.parity), now)}</p>
+        <p className="mb-3 rounded-lg bg-slate-100 px-3 py-2 text-sm text-slate-700">{todayBanner(lessonsThisWeek(lessons, week.parity).filter((lesson) => lesson.day == now.day), now)}</p>
       </div>
 
       {view === "today" && (
