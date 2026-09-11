@@ -171,10 +171,13 @@ export function dayBanner(lessons: Lesson[], now: LocalNow, day: DayName): strin
   return "Lecțiile de azi s-au încheiat";
 }
 
-export function todayBanner(lessons: Lesson[], now: LocalNow): string[] {
-  const mod = (a: Number, b: Number) => {
+export function todayBanner(lessons: Lesson[], now: LocalNow): string {
+  const mod = (a: number, b: number) => {
     if (a<b) return "NaN";
-    return [("h", Math.floor((a - b) / 60)), ("m", (a - b) % 60)].map((k, w) => w == 0 ? null : String(w)+k).filter((x) => x != null);
+    return [
+        ["h", Math.floor((a - b) / 60)], 
+        ["m", ((a - b) % 60)], 
+    ].map(([k, w]) => (w == 0) ? null : String(w)+k).filter((x) => x != null);
   }
   if (lessons.length === 0) return "Nu sunt lecții programate azi";
   const statuses = classifyLessons(lessons, now, now.day ?? "Luni");
