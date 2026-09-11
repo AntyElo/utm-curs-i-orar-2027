@@ -97,6 +97,7 @@ export interface LocalNow {
 }
 
 export function localNow(now = new Date()): LocalNow {
+  // Note: you can change 'new Date()' to 'new Date("2026-09-11T15:28:00")' for debug
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: TIMEZONE,
     weekday: "long",
@@ -173,7 +174,8 @@ export function dayBanner(lessons: Lesson[], now: LocalNow, day: DayName): strin
 export function todayBanner(lessons: Lesson[], now: LocalNow): string {
   if (lessons.length === 0) return "Nu sunt lecții programate azi";
   const statuses = classifyLessons(lessons, now, now.day);
-  if ([...statuses.values()].includes("current")) return `Acum este "${statuses.get("current")}" la ${next.start_time}`;
+  const [current, _] = [...statuses].find(([_, value]) => value === "current") ?? [];
+  if (current) return `Acum este "${lessons.find((lesson) => lesson.id === current)?.subject ?? "???"}"`;
   const next = lessons.find((lesson) => statuses.get(lesson.id) === "next");
   if (next) return `Următoarea lecție "${next.subject}" la ${next.start_time}`;
   return "Lecțiile de azi s-au încheiat";
