@@ -96,8 +96,8 @@ export interface LocalNow {
   timeLabel: string;
 }
 
-export function localNow(now = new Date()): LocalNow {
-  // Note: you can change 'new Date()' to 'new Date("2026-09-11T15:28:00")' for debug
+export function localNow(now = new Date("2026-09-14T06:28:00")): LocalNow {
+  // Note: you can change 'new Date()' to 'new Date("2026-09-14T13:28:00")' for debug
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: TIMEZONE,
     weekday: "long",
@@ -172,17 +172,17 @@ export function dayBanner(lessons: Lesson[], now: LocalNow, day: DayName): strin
 }
 
 export function todayBanner(lessons: Lesson[], now: LocalNow): string {
-  const mod = (a, b) => {
+  const mod = (a: Number, b: Number) => {
     if (a<b) return "NaN";
     const [h, m] = [Math.floor((a - b) / 60), (a - b) % 60].map(String);
     return [(h=="0" ? null : h+"h"), (m=="0" ? null : m+"m")].filter((x) => x != null);
   }
   if (lessons.length === 0) return "Nu sunt lecții programate azi";
-  const statuses = classifyLessons(lessons, now, now.day);
+  const statuses = classifyLessons(lessons, now, now.day ?? "Luni");
   const [currentRef, _] = [...statuses].find(([_, value]) => value === "current") ?? [];
   if (currentRef) {
     const current = lessons.find((lesson) => lesson.id === currentRef)
-    return `Acum este "${current.subject}" (${current.start_time}–${current.end_time})`
+    if (current) return `Acum este "${current.subject}" (${current.start_time}–${current.end_time})`
   };
   const next = lessons.find((lesson) => statuses.get(lesson.id) === "next");
   if (next) return `După ${mod(toMinutes(next.start_time), now.minutes)}: urmează "${next.subject}" (${next.start_time}–${next.end_time})`;
