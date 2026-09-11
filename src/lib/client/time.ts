@@ -169,3 +169,12 @@ export function dayBanner(lessons: Lesson[], now: LocalNow, day: DayName): strin
   if (next) return `Următoarea lecție la ${next.start_time}`;
   return "Lecțiile de azi s-au încheiat";
 }
+
+export function todayBanner(lessons: Lesson[], now: LocalNow): string {
+  if (lessons.length === 0) return "Nu sunt lecții programate azi";
+  const statuses = classifyLessons(lessons, now, now.day);
+  if ([...statuses.values()].includes("current")) return `Acum este "${statuses.get("current")}" la ${next.start_time}`;
+  const next = lessons.find((lesson) => statuses.get(lesson.id) === "next");
+  if (next) return `Următoarea lecție "${next.subject}" la ${next.start_time}`;
+  return "Lecțiile de azi s-au încheiat";
+}

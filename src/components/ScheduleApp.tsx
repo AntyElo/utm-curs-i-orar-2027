@@ -6,7 +6,7 @@ import type { DayName, Lesson } from "@/lib/models";
 import type { CourseOption, ScheduleResponse, StatusResponse } from "@/lib/client/types";
 import { groupFor, readPreferences, rememberCourse, rememberGroup, type Preferences } from "@/lib/client/preferences";
 import { loadCourse, LoadGenerations } from "@/lib/client/course-load";
-import { currentWeek, DAY_SHORT, formatDateTime, isOtherWeek, localNow, WEEK_PARITY_LABEL, type WeekInfo } from "@/lib/client/time";
+import { currentWeek, DAY_SHORT, formatDateTime, isOtherWeek, localNow, WEEK_PARITY_LABEL, todayBanner, lessonsThisWeek, type WeekInfo } from "@/lib/client/time";
 import { AllGroupsView } from "./AllGroupsView";
 import { DayTimeline } from "./DayTimeline";
 import { LessonCard } from "./LessonCard";
@@ -392,6 +392,7 @@ function GroupSchedule({ group, days, lessons, view, activeDay, todayName, onSel
           {now.dateLabel} · {now.timeLabel} (Chișinău)
         </p>
         <WeekBadge week={week} />
+        <p className="mb-3 rounded-lg bg-slate-100 px-3 py-2 text-sm text-slate-700">{todayBanner(lessonsThisWeek(lessons, week.parity), now)}</p>
       </div>
 
       {view === "today" && (
