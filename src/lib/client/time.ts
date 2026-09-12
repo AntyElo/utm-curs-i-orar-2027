@@ -96,7 +96,7 @@ export interface LocalNow {
   timeLabel: string;
 }
 
-export function localNow(now = new Date("2026-09-14T06:28:00")): LocalNow {
+export function localNow(now = new Date()): LocalNow {
   // Note: you can change 'new Date()' to 'new Date("2026-09-14T13:28:00")' for debug
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: TIMEZONE,
